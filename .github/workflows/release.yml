@@ -4,7 +4,6 @@
 name: Release
 on:
   push:
-  push:
     branches: [ "main", "dev", "sam-custom" ]
     tags:
       - "v*"
