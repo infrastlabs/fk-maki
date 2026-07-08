@@ -7,6 +7,25 @@ use etcetera::base_strategy::BaseStrategy;
 const FALLBACK_DIR: &str = ".maki";
 const APP_NAME: &str = "maki";
 
+/// Recognised config files that make `~/.maki/` a valid fallback directory.
+/// An empty `~/.maki/` must not shadow `~/.config/maki/`.
+const MAKI_CONFIG_FILES: &[&str] = &[
+    "init.lua",
+    "permissions.toml",
+    "providers.toml",
+    "mcp.toml",
+    "config.toml",
+    "AGENTS.md",
+];
+
+/// Recognised config sub-directories.
+const MAKI_CONFIG_DIRS: &[&str] = &["providers", "commands"];
+
+fn has_maki_content(dir: &Path) -> bool {
+    MAKI_CONFIG_FILES.iter().any(|f| dir.join(f).is_file())
+        || MAKI_CONFIG_DIRS.iter().any(|d| dir.join(d).is_dir())
+}
+
 static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
 
 struct Paths {
@@ -172,7 +191,7 @@ fn resolve() -> Option<&'static Paths> {
             let fallback_dir = etcetera::home_dir()
                 .ok()
                 .map(|h| h.join(FALLBACK_DIR))
-                .filter(|d| d.is_dir());
+                .filter(|d| d.is_dir() && has_maki_content(d));
             let xdg_config = s.config_dir().join(APP_NAME);
             let (data, cache, config) = match &fallback_dir {
                 Some(dir) => (dir.clone(), dir.clone(), dir.clone()),
