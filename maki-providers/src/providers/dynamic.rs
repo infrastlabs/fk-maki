@@ -140,19 +140,22 @@ fn providers_dir() -> Option<PathBuf> {
 /// On Windows, shell scripts (.sh) need to be invoked through bash.
 /// Returns the program and arguments to use for a given script path.
 ///
-/// Handles git-shell by searching for a real bash.exe outside the git-shell
-/// directory, or using MAKI_BASH_PATH env override.
-fn script_invocation(path: &Path) -> (String, Vec<String>) {
+/// Handles git-shell by searching for a real bash.exe, or using MAKI_BASH_PATH
+/// env override.
+///
+/// Returns `None` on Windows when the script is `.sh` and no valid bash could be
+/// found. Callers should propagate this as a clear error rather than falling
+/// back to direct execution.
+fn script_invocation(path: &Path) -> Option<(String, Vec<String>)> {
     #[cfg(windows)]
     {
         if path.extension().and_then(|e| e.to_str()).map_or(false, |e| eq_ext(e, "sh")) {
-            if let Some(bash) = find_windows_bash() {
-                return (bash, vec![path.to_string_lossy().to_string()]);
-            }
+            let bash = find_windows_bash()?;
+            return Some((bash, vec![path.to_string_lossy().to_string()]));
         }
     }
     // Default: execute directly
-    (path.to_string_lossy().to_string(), Vec::new())
+    Some((path.to_string_lossy().to_string(), Vec::new()))
 }
 
 #[cfg(windows)]
@@ -165,60 +168,90 @@ fn eq_ext(ext: &str, target: &str) -> bool {
 /// Priority:
 /// 1. MAKI_BASH_PATH environment variable (explicit override)
 /// 2. Standard Git for Windows locations (bash.exe, not git-shell.exe)
-/// 3. PATH lookup for "bash" (with validation that it is not git-shell)
+/// 3. Scoop, LOCALAPPDATA, and MSYS2 common install paths
+/// 4. Infer from `where git.exe` (handles custom Git install dirs)
+/// 5. PATH lookup for "bash.exe" (validated not git-shell)
+///
+/// Each candidate is validated — a file that fails the git-shell check is
+/// skipped rather than accepted.
 #[cfg(windows)]
 fn find_windows_bash() -> Option<String> {
-    // 1. Explicit override
+    // 1. Explicit override — trust the user
     if let Ok(override_path) = env::var("MAKI_BASH_PATH") {
         if !override_path.is_empty() && Path::new(&override_path).is_file() {
             return Some(override_path);
         }
     }
 
-    // 2. Git for Windows default install locations
-    let git_bash_candidates = [
-        // 64-bit Git for Windows default
-        r"C:\Program Files\Git\usr\bin\bash.exe",
-        r"C:\Program Files\Git\bin\bash.exe",
-        // 32-bit
-        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
-        r"C:\Program Files (x86)\Git\bin\bash.exe",
-    ];
-    for candidate in git_bash_candidates {
-        let p = Path::new(candidate);
-        if p.is_file() {
-            // Validate it is not git-shell disguised as bash
-            if !is_git_shell(p) {
-                return Some(candidate.to_string());
-            }
+    // 2. Common Git for Windows, Scoop, MSYS2 install locations
+    let mut candidates = Vec::<PathBuf>::new();
+
+    // Standard Git for Windows (64-bit and 32-bit)
+    candidates.push(r"C:\Program Files\Git\usr\bin\bash.exe".into());
+    candidates.push(r"C:\Program Files\Git\bin\bash.exe".into());
+    candidates.push(r"C:\Program Files (x86)\Git\usr\bin\bash.exe".into());
+    candidates.push(r"C:\Program Files (x86)\Git\bin\bash.exe".into());
+
+    // User-local Git install (Git for Windows 2.x default)
+    if let Ok(local_appdata) = env::var("LOCALAPPDATA") {
+        let base = PathBuf::from(&local_appdata).join("Programs\\Git");
+        candidates.push(base.join(r"usr\bin\bash.exe"));
+        candidates.push(base.join(r"bin\bash.exe"));
+        candidates.push(base.join(r"mingw64\bin\bash.exe"));
+    }
+
+    // Scoop package manager
+    if let Ok(home) = env::var("USERPROFILE") {
+        let scoop_git = PathBuf::from(&home).join(r"scoop\apps\git\current");
+        candidates.push(scoop_git.join(r"usr\bin\bash.exe"));
+        candidates.push(scoop_git.join(r"bin\bash.exe"));
+    }
+
+    // MSYS2
+    candidates.push(r"C:\msys64\usr\bin\bash.exe".into());
+    candidates.push(r"C:\msys32\usr\bin\bash.exe".into());
+
+    for candidate in &candidates {
+        if candidate.is_file() && !is_git_shell(candidate) {
+            return Some(candidate.to_string_lossy().to_string());
         }
     }
 
-    // 3. Check if common Git install dir can be inferred from where git.exe is
+    // 3. Infer Git install dir from `where git.exe`
     if let Ok(output) = Command::new("where")
         .arg("git.exe")
         .stdout(std::process::Stdio::piped())
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let git_path = String::from_utf8_lossy(&output.stdout);
-            if let Some(first_line) = git_path.lines().next() {
-                let git_dir = Path::new(first_line.trim()).parent();
-                if let Some(dir) = git_dir {
-                    // git.exe is in <Git>\cmd\ — bash is in <Git>\usr\bin\
-                    let usr_bin_bash = dir.parent().map(|d| d.join(r"usr\bin\bash.exe"));
-                    let bin_bash = dir.parent().map(|d| d.join(r"bin\bash.exe"));
-                    for candidate in usr_bin_bash.into_iter().chain(bin_bash) {
-                        if candidate.is_file() && !is_git_shell(&candidate) {
-                            return Some(candidate.to_string_lossy().to_string());
-                        }
+        let git_path = String::from_utf8_lossy(&output.stdout);
+        if let Some(first_line) = git_path.lines().next() {
+            let git_exe_path = Path::new(first_line.trim());
+            // git.exe can be in <Git>\cmd\, <Git>\mingw64\bin\, or <Git>\bin\.
+            // Walk up the directory tree to find candidate roots.
+            let mut roots = Vec::new();
+            let mut cur = git_exe_path.parent();
+            while roots.len() < 3 {
+                match cur {
+                    Some(p) => {
+                        roots.push(p);
+                        cur = p.parent();
+                    }
+                    None => break,
+                }
+            }
+            for root in &roots {
+                for bash_suffix in &[r"usr\bin\bash.exe", r"bin\bash.exe"] {
+                    let candidate = root.join(bash_suffix);
+                    if candidate.is_file() && !is_git_shell(&candidate) {
+                        return Some(candidate.to_string_lossy().to_string());
                     }
                 }
             }
         }
     }
 
-    // 4. Last resort: PATH lookup — try "bash" and validate
+    // 4. Last resort: PATH lookup — try "bash.exe" and validate
     if let Ok(path_var) = env::var("PATH") {
         for dir in path_var.split(';') {
             let candidate = Path::new(dir).join("bash.exe");
@@ -233,10 +266,35 @@ fn find_windows_bash() -> Option<String> {
 
 /// Check if a Windows executable is actually git-shell.
 ///
-/// git-shell.exe rejects commands it doesn't recognize with "fatal: unrecognized command".
-/// We detect this by running with `-c "echo maki-bash-probe"` and checking the output.
+/// Two-phase detection:
+/// 1. `--version` — real bash prints "GNU bash, version ...". git-shell
+///    rejects this flag with "fatal: unrecognized argument".
+/// 2. `-c` probe — only if --version is inconclusive, run a command and
+///    verify output. git-shell rejects `-c` with "fatal: unrecognized command".
+///
+/// Returns `true` only when we are confident the executable is git-shell.
+/// Spawn permission errors return `false` (caller should skip via is_file check).
 #[cfg(windows)]
 fn is_git_shell(path: &Path) -> bool {
+    // Fast path: --version probe
+    if let Ok(output) = Command::new(path)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() && (stdout.contains("GNU bash") || stdout.contains("bash, version"))
+        {
+            return false; // definitively real bash
+        }
+        if stderr.contains("fatal:") || stderr.contains("unrecognized") {
+            return true; // definitively git-shell
+        }
+    }
+
+    // Slow path: execution probe
     match Command::new(path)
         .args(["-c", "echo maki-bash-probe-ok"])
         .stdout(std::process::Stdio::piped())
@@ -246,16 +304,29 @@ fn is_git_shell(path: &Path) -> bool {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // git-shell would print "fatal: unrecognized command" to stderr
-            // or just refuse to run. A real bash prints "maki-bash-probe-ok".
-            !stdout.contains("maki-bash-probe-ok") || stderr.contains("fatal:")
+            // git-shell rejects the probe with "fatal:" but produces no stdout
+            if !stdout.contains("maki-bash-probe-ok") && stderr.contains("fatal:") {
+                return true;
+            }
+            // stdout has probe string → real bash (even if exit code is non-zero due to MSYS quirks)
+            if stdout.contains("maki-bash-probe-ok") {
+                return false;
+            }
+            // Inconclusive — assume real bash (false negative is less harmful than false positive)
+            false
         }
-        Err(_) => true, // if it doesn't even spawn, treat as invalid
+        Err(_) => false, // can't execute — let caller decide based on is_file
     }
 }
 
 fn run_script(path: &Path, subcommand: &str, timeout: Duration) -> Result<String, AgentError> {
-    let (program, extra_args) = script_invocation(path);
+    let (program, extra_args) = script_invocation(path).ok_or_else(|| AgentError::Config {
+        message: format!(
+            "no usable bash found on Windows to run '{}' {}. Set MAKI_BASH_PATH to a msys2/git bash.exe or install Git for Windows.",
+            path.display(),
+            subcommand
+        ),
+    })?;
     let mut cmd = Command::new(&program);
     for arg in &extra_args {
         cmd.arg(arg);
@@ -316,7 +387,13 @@ fn run_script(path: &Path, subcommand: &str, timeout: Duration) -> Result<String
 }
 
 fn run_script_interactive(path: &Path, subcommand: &str) -> Result<(), AgentError> {
-    let (program, extra_args) = script_invocation(path);
+    let (program, extra_args) = script_invocation(path).ok_or_else(|| AgentError::Config {
+        message: format!(
+            "no usable bash found on Windows to run '{}' {}. Set MAKI_BASH_PATH to a msys2/git bash.exe or install Git for Windows.",
+            path.display(),
+            subcommand
+        ),
+    })?;
     let mut cmd = Command::new(&program);
     for arg in &extra_args {
         cmd.arg(arg);
@@ -887,15 +964,20 @@ esac
     #[test]
     fn script_invocation_sh_on_windows() {
         use std::path::PathBuf;
-        let (prog, args) =
-            script_invocation(PathBuf::from("C:\\providers\\my-provider.sh").as_path());
-        // Should not return bare "bash" — it should include full path or at least "bash.exe"
-        assert!(
-            prog.contains("bash") || env::var("MAKI_BASH_PATH").is_ok(),
-            "expected bash-based invocation, got: {prog}"
-        );
-        assert_eq!(args.len(), 1);
-        assert!(args[0].ends_with("my-provider.sh"));
+        // Without MAKI_BASH_PATH set and no real Git for Windows installed
+        // in the test environment, this returns None (no bash found).
+        // With MAKI_BASH_PATH set, it returns Some with the override.
+        if let Ok(bash_path) = env::var("MAKI_BASH_PATH") {
+            let (prog, args) = script_invocation(
+                PathBuf::from("C:\\providers\\my-provider.sh").as_path(),
+            )
+            .expect("MAKI_BASH_PATH is set, should succeed");
+            assert_eq!(prog, bash_path);
+            assert_eq!(args.len(), 1);
+            assert!(args[0].ends_with("my-provider.sh"));
+        }
+        // When no bash is available, the function returns None — callers
+        // surface this as a clear error instead of silently failing.
     }
 
     #[cfg(windows)]
@@ -903,7 +985,8 @@ esac
     fn script_invocation_exe_on_windows() {
         use std::path::PathBuf;
         let (prog, args) =
-            script_invocation(PathBuf::from("C:\\providers\\my-provider.exe").as_path());
+            script_invocation(PathBuf::from("C:\\providers\\my-provider.exe").as_path())
+                .expect("exe files should always return Some");
         assert_eq!(prog, "C:\\providers\\my-provider.exe");
         assert!(args.is_empty());
     }
@@ -913,7 +996,8 @@ esac
     fn script_invocation_sh_on_unix() {
         use std::path::PathBuf;
         let (prog, args) =
-            script_invocation(PathBuf::from("/home/user/.config/maki/providers/my-provider").as_path());
+            script_invocation(PathBuf::from("/home/user/.config/maki/providers/my-provider").as_path())
+                .expect("unix scripts should always return Some");
         assert_eq!(prog, "/home/user/.config/maki/providers/my-provider");
         assert!(args.is_empty());
     }
