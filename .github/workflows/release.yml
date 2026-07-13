@@ -4,7 +4,7 @@
 name: Release
 on:
   push:
-    branches: [ "main", "dev", "sam-custom" ]
+    branches: [ "main", "dev", "sam-custom", "feat/*" ]
     tags:
       - "v*"
 env:
