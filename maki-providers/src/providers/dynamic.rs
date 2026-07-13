@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::env;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -139,17 +141,119 @@ fn providers_dir() -> Option<PathBuf> {
 
 /// On Windows, shell scripts (.sh) need to be invoked through bash.
 /// Returns the program and arguments to use for a given script path.
+///
+/// Handles git-shell by searching for a real bash.exe outside the git-shell
+/// directory, or using MAKI_BASH_PATH env override.
 fn script_invocation(path: &Path) -> (String, Vec<String>) {
     #[cfg(windows)]
     {
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if ext.eq_ignore_ascii_case("sh") {
-                return ("bash".to_string(), vec![path.to_string_lossy().to_string()]);
+        if path.extension().and_then(|e| e.to_str()).map_or(false, |e| eq_ext(e, "sh")) {
+            if let Some(bash) = find_windows_bash() {
+                return (bash, vec![path.to_string_lossy().to_string()]);
             }
         }
     }
     // Default: execute directly
     (path.to_string_lossy().to_string(), Vec::new())
+}
+
+#[cfg(windows)]
+fn eq_ext(ext: &str, target: &str) -> bool {
+    ext.eq_ignore_ascii_case(target)
+}
+
+/// Find a working bash on Windows.
+///
+/// Priority:
+/// 1. MAKI_BASH_PATH environment variable (explicit override)
+/// 2. Standard Git for Windows locations (bash.exe, not git-shell.exe)
+/// 3. PATH lookup for "bash" (with validation that it is not git-shell)
+#[cfg(windows)]
+fn find_windows_bash() -> Option<String> {
+    // 1. Explicit override
+    if let Ok(override_path) = env::var("MAKI_BASH_PATH") {
+        if !override_path.is_empty() && Path::new(&override_path).is_file() {
+            return Some(override_path);
+        }
+    }
+
+    // 2. Git for Windows default install locations
+    let git_bash_candidates = [
+        // 64-bit Git for Windows default
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files\Git\bin\bash.exe",
+        // 32-bit
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ];
+    for candidate in git_bash_candidates {
+        let p = Path::new(candidate);
+        if p.is_file() {
+            // Validate it is not git-shell disguised as bash
+            if !is_git_shell(p) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    // 3. Check if common Git install dir can be inferred from where git.exe is
+    if let Ok(output) = Command::new("where")
+        .arg("git.exe")
+        .stdout(std::process::Stdio::piped())
+        .output()
+    {
+        if output.status.success() {
+            let git_path = String::from_utf8_lossy(&output.stdout);
+            if let Some(first_line) = git_path.lines().next() {
+                let git_dir = Path::new(first_line.trim()).parent();
+                if let Some(dir) = git_dir {
+                    // git.exe is in <Git>\cmd\ — bash is in <Git>\usr\bin\
+                    let usr_bin_bash = dir.parent().map(|d| d.join(r"usr\bin\bash.exe"));
+                    let bin_bash = dir.parent().map(|d| d.join(r"bin\bash.exe"));
+                    for candidate in usr_bin_bash.into_iter().chain(bin_bash) {
+                        if candidate.is_file() && !is_git_shell(&candidate) {
+                            return Some(candidate.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Last resort: PATH lookup — try "bash" and validate
+    if let Ok(path_var) = env::var("PATH") {
+        for dir in path_var.split(';') {
+            let candidate = Path::new(dir).join("bash.exe");
+            if candidate.is_file() && !is_git_shell(&candidate) {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if a Windows executable is actually git-shell.
+///
+/// git-shell.exe rejects commands it doesn't recognize with "fatal: unrecognized command".
+/// We detect this by running with `-c "echo maki-bash-probe"` and checking the output.
+#[cfg(windows)]
+fn is_git_shell(path: &Path) -> bool {
+    match Command::new(path)
+        .args(["-c", "echo maki-bash-probe-ok"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // git-shell would print "fatal: unrecognized command" to stderr
+            // or just refuse to run. A real bash prints "maki-bash-probe-ok".
+            !stdout.contains("maki-bash-probe-ok") || stderr.contains("fatal:")
+        }
+        Err(_) => true, // if it doesn't even spawn, treat as invalid
+    }
 }
 
 fn run_script(path: &Path, subcommand: &str, timeout: Duration) -> Result<String, AgentError> {
@@ -868,5 +972,40 @@ esac
         let providers = discover_in(tmp.path());
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].base, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_invocation_sh_on_windows() {
+        use std::path::PathBuf;
+        let (prog, args) =
+            script_invocation(PathBuf::from("C:\\providers\\my-provider.sh").as_path());
+        // Should not return bare "bash" — it should include full path or at least "bash.exe"
+        assert!(
+            prog.contains("bash") || env::var("MAKI_BASH_PATH").is_ok(),
+            "expected bash-based invocation, got: {prog}"
+        );
+        assert_eq!(args.len(), 1);
+        assert!(args[0].ends_with("my-provider.sh"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_invocation_exe_on_windows() {
+        use std::path::PathBuf;
+        let (prog, args) =
+            script_invocation(PathBuf::from("C:\\providers\\my-provider.exe").as_path());
+        assert_eq!(prog, "C:\\providers\\my-provider.exe");
+        assert!(args.is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn script_invocation_sh_on_unix() {
+        use std::path::PathBuf;
+        let (prog, args) =
+            script_invocation(PathBuf::from("/home/user/.config/maki/providers/my-provider").as_path());
+        assert_eq!(prog, "/home/user/.config/maki/providers/my-provider");
+        assert!(args.is_empty());
     }
 }
