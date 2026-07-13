@@ -137,9 +137,29 @@ fn providers_dir() -> Option<PathBuf> {
         .map(|d| d.join(PROVIDERS_DIR))
 }
 
+/// On Windows, shell scripts (.sh) need to be invoked through bash.
+/// Returns the program and arguments to use for a given script path.
+fn script_invocation(path: &Path) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ext.eq_ignore_ascii_case("sh") {
+                return ("bash".to_string(), vec![path.to_string_lossy().to_string()]);
+            }
+        }
+    }
+    // Default: execute directly
+    (path.to_string_lossy().to_string(), Vec::new())
+}
+
 fn run_script(path: &Path, subcommand: &str, timeout: Duration) -> Result<String, AgentError> {
-    let mut child = Command::new(path)
-        .arg(subcommand)
+    let (program, extra_args) = script_invocation(path);
+    let mut cmd = Command::new(&program);
+    for arg in &extra_args {
+        cmd.arg(arg);
+    }
+    cmd.arg(subcommand);
+    let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -194,8 +214,13 @@ fn run_script(path: &Path, subcommand: &str, timeout: Duration) -> Result<String
 }
 
 fn run_script_interactive(path: &Path, subcommand: &str) -> Result<(), AgentError> {
-    let status = Command::new(path)
-        .arg(subcommand)
+    let (program, extra_args) = script_invocation(path);
+    let mut cmd = Command::new(&program);
+    for arg in &extra_args {
+        cmd.arg(arg);
+    }
+    cmd.arg(subcommand);
+    let status = cmd
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
@@ -370,13 +395,14 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
         {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 let ext = ext.to_ascii_lowercase();
-                if !matches!(ext.as_str(), "exe" | "bat" | "cmd" | "ps1") {
+                if !matches!(ext.as_str(), "exe" | "bat" | "cmd" | "ps1" | "sh") {
                     debug!(path = %path.display(), "skipping non-executable file");
                     continue;
                 }
             } else {
-                debug!(path = %path.display(), "skipping file without extension");
-                continue;
+                // On Windows, if running under git-shell (bash), shell scripts without extension might be valid
+                // Try to read as potential script anyway — run_script will fail gracefully if not executable
+                debug!(path = %path.display(), "no extension, attempting execution");
             }
         }
 
