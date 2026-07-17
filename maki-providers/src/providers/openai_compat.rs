@@ -510,7 +510,12 @@ pub async fn parse_sse(
         }
 
         let chunk: SseChunk = match serde_json::from_str(data) {
-            Ok(c) => c,
+            Ok(c) => {
+                if data.contains("tool_call") {
+                    debug!(raw_sse = %data, "SSE tool_call chunk");
+                }
+                c
+            }
             Err(e) => {
                 warn!(error = %e, "failed to parse SSE chunk");
                 continue;
@@ -625,8 +630,13 @@ pub async fn parse_sse(
                     acc.id = id;
                 }
                 if let Some(func) = tc.function {
-                    if let Some(name) = func.name {
-                        acc.name = name;
+                    if let Some(name) = func.name.as_ref() {
+                        // Don't overwrite a non-empty name with an empty one;
+                        // some APIs send the name at the top level first, then
+                        // send function.name as empty string in later deltas.
+                        if !name.is_empty() || acc.name.is_empty() {
+                            acc.name = name.clone();
+                        }
                     }
                     if let Some(args) = func.arguments {
                         acc.arguments.push_str(&args);
