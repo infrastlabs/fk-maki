@@ -399,6 +399,7 @@ pub fn convert_tools(anthropic_tools: &Value) -> Value {
 struct ToolCallDelta {
     index: usize,
     id: Option<String>,
+    name: Option<String>,
     function: Option<FunctionDelta>,
 }
 
@@ -663,6 +664,13 @@ pub async fn parse_sse(
                     if let Some(args) = func.arguments {
                         acc.arguments.push_str(&args);
                     }
+                }
+                // Fallback: some OpenAI-compatible APIs place the tool name
+                // at the top level (tool_calls[i].name) instead of inside
+                // function.name. Without this, acc.name stays empty and the
+                // downstream dispatch produces "maki_unknown_tool".
+                if acc.name.is_empty() && let Some(name) = tc.name.as_ref() {
+                    acc.name = name.clone();
                 }
                 if was_unnamed && !acc.name.is_empty() {
                     event_tx
