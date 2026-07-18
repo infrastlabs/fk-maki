@@ -2,10 +2,10 @@
 
 ## 背景
 
-商汤 API 平台的部分模型在 SSE 流式响应中，tool call 字段的位置与标准 OpenAI Chat Completions 格式存在偏差。Maki 的 SS e 解析器 `openai_compat.rs` 未能正确解析，导致两个问题：
+商汤 API 平台的部分模型在 SSE 流式响应中，tool call 字段的位置与标准 OpenAI Chat Completions 格式存在偏差。Maki 的 SSE 解析器 `openai_compat.rs` 未能正确解析，导致两个问题：
 
 1. 工具调用失败，报 `maki_unknown_tool`（工具名称为空）
-2. UI 中 bash 命令持续显示"⠹"运行中状态
+2. UI 中 bash 命令持续显示"⠹/⠋/⠧"运行中状态
 
 Zerostack (rig 框架) 的 SSE 解析器兼容性更宽松，未出现此问题。
 
@@ -35,7 +35,6 @@ struct ToolCallDelta {
 添加 `name: Option<String>` 字段到 `ToolCallDelta`，并在 `parse_sse` 中增加 fallback：
 
 ```rust
-// ToolCallDelta 新增顶层 name 字段
 struct ToolCallDelta {
     index: usize,
     id: Option<String>,
@@ -97,8 +96,9 @@ Ok(c) => {
 
 ## 修复 3：id 分批发来时通知 UI
 
-- **提交**: `3c33d9f`
-- **改动**: `maki-providers/src/providers/openai_compat.rs` +7/-1 行
+- **提交 1**: `3c33d9f` — 第一次尝试（有 bug）
+- **提交 2**: `a384a2d` — 最终修复
+- **改动**: `maki-providers/src/providers/openai_compat.rs` +5/-6 行
 
 ### 问题
 
@@ -107,33 +107,27 @@ UI 通过 tool_call `id` 来跟踪工具状态：
 - `ToolDone(id)` → 标记为"已完成"，移除 spinner
 
 商汤 API 分批发 name 和 id：
-1. Delta 1: `{"name":"bash"}` → ToolUseStart(id="", name="bash") → UI 用空 id 跟踪
-2. Delta 2: `{"id":"call_xxx"}` → 不发 ToolUseStart（name 已非空）→ UI 没更新 id
-3. 工具完成 → ToolDone(id="call_xxx") → 不匹配 id="" → spinner 永远转
+1. Delta: `{"name":"bash"}` + Delta: `{"id":"call_xxx","function":{"arguments":"{}"}}`
 
-### 修复
+第一次修复（v3）在 name 出现时发一次 ToolUseStart(id="")，id 出现时再发一次
+ToolUseStart(id="call_xxx")。UI 创建了两个 pending 条目，只有第二个被
+ToolDone 清除，第一个空 id 条目永远旋转。
 
-`ToolUseStart` 的触发条件从仅 name 变化扩展为 name 或 id 任一首次出现：
+### 最终修复
+
+**只在 id 和 name 都已知时才通知 UI**：
 
 ```rust
-// 原来
-if was_unnamed && !acc.name.is_empty() { ... }
-
-// 改为
-let is_named = !acc.name.is_empty();
-let has_id = !acc.id.is_empty();
-if (was_unnamed && is_named) || (was_idless && has_id && is_named) {
+// 最终版本
+if !acc.id.is_empty() && !acc.name.is_empty() && (was_idless || was_unnamed) {
     event_tx.send_async(ProviderEvent::ToolUseStart {
-        id: acc.id.clone(),   // ← 这次可能是真实 id
+        id: acc.id.clone(),
         name: acc.name.clone(),
     }).await?;
 }
 ```
 
-修改后 SSE 流式时序：
-1. Delta 1: `{"name":"bash"}` → ToolUseStart(id="", name="bash") ✅ UI 开始跟踪
-2. Delta 2: `{"id":"call_xxx"}` → ToolUseStart(id="call_xxx", name="bash") ✅ UI 更新 id
-3. 工具完成 → ToolDone(id="call_xxx") ✅ 匹配，UI 停止 spinner
+这样无论 id 和 name 以什么顺序到达，都只发一次 ToolUseStart，且 id 必非空。
 
 ---
 
@@ -141,7 +135,7 @@ if (was_unnamed && is_named) || (was_idless && has_id && is_named) {
 
 | 文件 | 改动 |
 |------|------|
-| `maki-providers/src/providers/openai_compat.rs` | +28/-4 行（3 次提交累计） |
+| `maki-providers/src/providers/openai_compat.rs` | 约 +28/-6 行（4 次提交累计） |
 
 ### 最终代码（关键部分）
 
@@ -174,15 +168,20 @@ if let Some(func) = tc.function {
         acc.arguments.push_str(&args);
     }
 }
+// Fallback: some APIs put name at top level (tool_calls[i].name)
 if acc.name.is_empty() && let Some(name) = tc.name.as_ref() {
     acc.name = name.clone();
 }
-let is_named = !acc.name.is_empty();
-let has_id = !acc.id.is_empty();
-if (was_unnamed && is_named) || (was_idless && has_id && is_named) {
+// Only notify UI when both id and name are known, otherwise the
+// pending entry would have an empty id and never match ToolDone.
+if !acc.id.is_empty() && !acc.name.is_empty() && (was_idless || was_unnamed) {
     event_tx.send_async(ProviderEvent::ToolUseStart {
         id: acc.id.clone(),
         name: acc.name.clone(),
     }).await?;
 }
 ```
+
+### 文件位置
+
+`maki-providers/src/providers/openai_compat.rs`
