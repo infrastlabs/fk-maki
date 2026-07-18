@@ -658,7 +658,12 @@ pub async fn parse_sse(
                 let was_unnamed = acc.name.is_empty();
                 let was_idless = acc.id.is_empty();
                 if let Some(id) = tc.id {
-                    acc.id = id;
+                    // Same guard as name: don't overwrite a non-empty id
+                    // with an empty one. Shangtang API sends id="" on every
+                    // delta after the first, clobbering the correct id.
+                    if !id.is_empty() || acc.id.is_empty() {
+                        acc.id = id;
+                    }
                 }
                 // GLM-5.2 via Mistral sends "" names in subsequent chunks; skip to keep the accumulated name.
                 if let Some(func) = tc.function {
@@ -1499,6 +1504,54 @@ data: [DONE]\n";
             }
             assert_eq!(starts[0], ("c2".into(), "grep".into()));
             assert_eq!(starts[1], ("c1".into(), "bash".into()));
+        })
+    }
+
+    #[test]
+    /// Shangtang API pattern: first delta has valid id+name, subsequent
+    /// deltas repeatedly send id="" and name="" (empty). The parser must
+    /// not overwrite the already-known id and name with empty strings,
+    /// otherwise ToolUseStart's id and ContentBlock.ToolUse.id diverge,
+    /// causing the UI spinner to spin forever.
+    fn sse_shangtang_subsequent_empty_id_and_name() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"\",\"function\":{\"name\":\"\",\"arguments\":\"{\\\"command\\\":\\\"date\\\"}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            // id must NOT be "maki_unnamed_0" (placeholder) - it must be
+            // preserved from the first delta despite subsequent empty ids.
+            assert_eq!(tools[0].0, "call_abc", "id must survive empty overwrites");
+            assert_eq!(tools[0].1, "bash", "name must survive empty overwrites");
+            assert_eq!(tools[0].2["command"], "date");
+
+            // ToolUseStart must be sent only ONCE with the correct id
+            let starts: Vec<_> = rx
+                .drain()
+                .filter_map(|e| match e {
+                    ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                starts.len(),
+                1,
+                "exactly one ToolUseStart, got: {:?}",
+                starts
+            );
+            assert_eq!(starts[0], ("call_abc".into(), "bash".into()));
         })
     }
 }
