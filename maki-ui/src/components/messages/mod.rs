@@ -23,6 +23,7 @@ use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use maki_config::{ToolOutputLines, UiConfig};
+use tracing::{debug, warn};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -164,8 +165,10 @@ impl MessagesPanel {
             .iter()
             .any(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == id))
         {
+            debug!(%id, %name, "tool_pending: duplicate, skipping");
             return;
         }
+        debug!(%id, %name, "tool_pending: creating entry");
         self.flush();
         let role = DisplayRole::Tool(Box::new(ToolRole {
             id,
@@ -238,6 +241,15 @@ impl MessagesPanel {
             .iter_mut()
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == event.id))
         else {
+            warn!(
+                event_id = %event.id,
+                tool = %event.tool,
+                available_ids = ?self.messages.iter().filter_map(|m| match &m.role {
+                    DisplayRole::Tool(t) => Some(t.id.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>(),
+                "tool_done: no matching pending message found",
+            );
             return;
         };
         if let DisplayRole::Tool(t) = &mut msg.role {
