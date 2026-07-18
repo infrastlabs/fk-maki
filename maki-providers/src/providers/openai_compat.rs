@@ -1163,4 +1163,214 @@ data: [DONE]\n";
             assert_eq!(thinking_deltas, vec!["Let me think", "..."]);
         })
     }
+
+    #[test]
+    /// Simulates Shangtang API: tool name at top level (tool_calls[i].name),
+    /// id and arguments in function. Verifies name is picked up from the
+    /// fallback path and ToolUseStart is sent only once with a non-empty id.
+    fn sse_tool_name_at_top_level_fallback() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"name\":\"bash\",\"function\":{\"arguments\":\"\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"function\":{\"arguments\":\"{\\\"command\\\":\\\"date\\\"}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1, "one tool call expected");
+            assert!(
+                !tools[0].0.is_empty(),
+                "id must be non-empty, got: {:?}",
+                tools[0].0
+            );
+            assert_eq!(tools[0].0, "call_abc", "id should be the provider's id");
+            assert_eq!(tools[0].1, "bash", "tool name should be 'bash'");
+            assert_eq!(tools[0].2["command"], "date", "arguments should be complete");
+
+            // ToolUseStart should be sent exactly ONCE, with non-empty id
+            let starts: Vec<_> = rx
+                .drain()
+                .filter_map(|e| match e {
+                    ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                starts.len(),
+                1,
+                "ToolUseStart should be sent exactly once, got: {:?}",
+                starts
+            );
+            assert!(
+                !starts[0].0.is_empty(),
+                "ToolUseStart id must be non-empty, got: {:?}",
+                starts[0].0
+            );
+            assert_eq!(starts[0], ("call_abc".into(), "bash".into()));
+        })
+    }
+
+    #[test]
+    /// Shangtang API scenario: first delta has name at top level, later
+    /// delta overwrites function.name with empty string. The empty
+    /// string must NOT overwrite the already-parsed top-level name.
+    fn sse_tool_name_top_then_empty_function_name() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"name\":\"read\",\"function\":{\"arguments\":\"\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_r1\",\"function\":{\"arguments\":\"{\\\"path\\\":\\\"/tmp\\\"}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].0, "call_r1");
+            assert_eq!(tools[0].1, "read", "name must survive empty overwrite");
+            assert_eq!(tools[0].2["path"], "/tmp");
+        })
+    }
+
+    #[test]
+    /// Name and id in same delta at top level (non-standard but possible).
+    fn sse_tool_name_and_id_at_top_level() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_top\",\"name\":\"grep\",\"function\":{\"arguments\":\"{\\\"pattern\\\":\\\"test\\\"}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].0, "call_top");
+            assert_eq!(tools[0].1, "grep");
+            assert_eq!(tools[0].2["pattern"], "test");
+
+            let starts: Vec<_> = rx
+                .drain()
+                .filter_map(|e| match e {
+                    ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(starts.len(), 1, "must send ToolUseStart exactly once");
+            assert_eq!(starts[0], ("call_top".into(), "grep".into()));
+        })
+    }
+
+    #[test]
+    /// Standard OpenAI format: name and id in function, both in first delta.
+    fn sse_tool_name_in_function_standard() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c_std\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].0, "c_std");
+            assert_eq!(tools[0].1, "bash");
+            assert_eq!(tools[0].2["command"], "ls");
+
+            let starts: Vec<_> = rx
+                .drain()
+                .filter_map(|e| match e {
+                    ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                starts,
+                vec![("c_std".into(), "bash".into())],
+                "standard format: one ToolUseStart with correct id+name"
+            );
+        })
+    }
+
+    #[test]
+    /// Multiple parallel tool calls where some deltas split name to
+    /// top level and id to function. Verifies no duplicate pending
+    /// entries and no empty-id ToolUseStart.
+    fn sse_parallel_tool_calls_mixed_format() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"name\":\"bash\",\"function\":{\"arguments\":\"\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"grep\",\"arguments\":\"\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"arguments\":\"{\\\"command\\\":\\\"date\\\"}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"pattern\\\":\\\"foo\\\"}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 2);
+            assert_eq!(tools[0].0, "c1");
+            assert_eq!(tools[0].1, "bash");
+            assert_eq!(tools[0].2["command"], "date");
+            assert_eq!(tools[1].0, "c2");
+            assert_eq!(tools[1].1, "grep");
+            assert_eq!(tools[1].2["pattern"], "foo");
+
+            let starts: Vec<_> = rx
+                .drain()
+                .filter_map(|e| match e {
+                    ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                starts.len(),
+                2,
+                "exactly two ToolUseStart events, got: {:?}",
+                starts
+            );
+            // Both must have non-empty ids
+            for (i, (id, _)) in starts.iter().enumerate() {
+                assert!(!id.is_empty(), "ToolUseStart {} has empty id", i);
+            }
+            assert_eq!(starts[0], ("c2".into(), "grep".into()));
+            assert_eq!(starts[1], ("c1".into(), "bash".into()));
+        })
+    }
 }
