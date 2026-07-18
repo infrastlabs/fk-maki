@@ -656,6 +656,7 @@ pub async fn parse_sse(
                 }
                 let acc = &mut tool_accumulators[tc.index];
                 let was_unnamed = acc.name.is_empty();
+                let was_idless = acc.id.is_empty();
                 if let Some(id) = tc.id {
                     acc.id = id;
                 }
@@ -680,7 +681,12 @@ pub async fn parse_sse(
                 if acc.name.is_empty() && let Some(name) = tc.name.as_ref() {
                     acc.name = name.clone();
                 }
-                if was_unnamed && !acc.name.is_empty() {
+                // Notify the UI when either the name or the id becomes
+                // available. Some APIs stream them in separate deltas, so
+                // we need to update the UI with the real id when it arrives.
+                let is_named = !acc.name.is_empty();
+                let has_id = !acc.id.is_empty();
+                if (was_unnamed && is_named) || (was_idless && has_id && is_named) {
                     event_tx
                         .send_async(ProviderEvent::ToolUseStart {
                             id: acc.id.clone(),
