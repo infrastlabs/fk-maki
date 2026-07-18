@@ -2,10 +2,10 @@
 
 ## 背景
 
-商汤 API 平台的部分模型在 SSE 流式响应中，tool call 字段的位置与标准 OpenAI Chat Completions 格式存在偏差。Maki 的 SS e 解析器 `openai_compat.rs` 未能正确解析，导致两个问题：
+商汤 API 平台的部分模型在 SSE 流式响应中，tool call 字段的位置与标准 OpenAI Chat Completions 格式存在偏差。Maki 的 SSE 解析器 `openai_compat.rs` 未能正确解析，导致两个问题：
 
 1. 工具调用失败，报 `maki_unknown_tool`（工具名称为空）
-2. UI 中 bash 命令持续显示"⠹"运行中状态
+2. UI 中 bash 命令持续显示"⠹/⠋/⠧"运行中状态
 
 Zerostack (rig 框架) 的 SSE 解析器兼容性更宽松，未出现此问题。
 
@@ -35,7 +35,6 @@ struct ToolCallDelta {
 添加 `name: Option<String>` 字段到 `ToolCallDelta`，并在 `parse_sse` 中增加 fallback：
 
 ```rust
-// ToolCallDelta 新增顶层 name 字段
 struct ToolCallDelta {
     index: usize,
     id: Option<String>,
@@ -58,82 +57,119 @@ if acc.name.is_empty() && let Some(name) = tc.name.as_ref() {
 
 ### 问题
 
-商汤 API 可能先发顶层 `name`，后续 delta 又发了空的 `function.name = ""`，导致已解析的正确名称被覆盖。
+商汤 API 在首帧之后，后续每一帧都发送 `function.name=""`（空字符串），导致已解析的正确名称被覆盖。
 
 时序：
-1. Delta 1: `{"index":0,"name":"bash"}` → acc.name = "bash" (通过 fallback)
-2. Delta 2: `{"index":0,"function":{"name":"","arguments":"{}"}}` → acc.name = "" (覆盖!)
-
-### 修复 2.1：防空字符串覆盖
-
-```rust
-// 原来
-if let Some(name) = func.name {
-    acc.name = name;  // 无条件覆盖
-}
-
-// 改为
-if let Some(name) = func.name.as_ref() {
-    if !name.is_empty() || acc.name.is_empty() {
-        acc.name = name.clone();  // 仅当新名称非空或旧名称为空时覆盖
-    }
-}
-```
-
-### 修复 2.2：SSE 原始数据日志
-
-```rust
-Ok(c) => {
-    if data.contains("tool_call") {
-        debug!(raw_sse = %data, "SSE tool_call chunk");
-    }
-    c
-}
-```
-
-运行 `RUST_LOG=maki_providers=debug maki` 可查看原始 SSE 数据。
-
----
-
-## 修复 3：id 分批发来时通知 UI
-
-- **提交**: `3c33d9f`
-- **改动**: `maki-providers/src/providers/openai_compat.rs` +7/-1 行
-
-### 问题
-
-UI 通过 tool_call `id` 来跟踪工具状态：
-- `ToolUseStart(id, name)` → 标记为"运行中"
-- `ToolDone(id)` → 标记为"已完成"，移除 spinner
-
-商汤 API 分批发 name 和 id：
-1. Delta 1: `{"name":"bash"}` → ToolUseStart(id="", name="bash") → UI 用空 id 跟踪
-2. Delta 2: `{"id":"call_xxx"}` → 不发 ToolUseStart（name 已非空）→ UI 没更新 id
-3. 工具完成 → ToolDone(id="call_xxx") → 不匹配 id="" → spinner 永远转
+1. Delta 1: `{"function":{"name":"bash","arguments":""}}` → acc.name = "bash"
+2. Delta 2: `{"function":{"name":"","arguments":"{\"command\":"}}` → acc.name = "" (覆盖!)
 
 ### 修复
 
-`ToolUseStart` 的触发条件从仅 name 变化扩展为 name 或 id 任一首次出现：
+```rust
+// 原来：无条件覆盖
+if let Some(name) = func.name {
+    acc.name = name;
+}
+
+// 改为：仅当新名称非空或旧名称为空时覆盖
+if let Some(name) = func.name.as_ref() {
+    if !name.is_empty() || acc.name.is_empty() {
+        acc.name = name.clone();
+    }
+}
+```
+
+同时添加 SSE 原始数据日志（`data.contains("tool_call")` 时 debug 打印），便于诊断。
+
+---
+
+## 修复 3：等待 id 和 name 就绪才通知 UI
+
+- **提交 1**: `3c33d9f` — 第一次尝试（有 bug）
+- **提交 2**: `a384a2d` — 最终修复
+
+### 问题
+
+`ToolUseStart` 可能在 id 为空时发送，UI 用空 id 创建 pending 条目。后续 `ToolDone` 带真实 id 无法匹配，条目永远旋转。
+
+### 修复
 
 ```rust
-// 原来
-if was_unnamed && !acc.name.is_empty() { ... }
-
-// 改为
-let is_named = !acc.name.is_empty();
-let has_id = !acc.id.is_empty();
-if (was_unnamed && is_named) || (was_idless && has_id && is_named) {
+// 只在 id 和 name 都非空时才通知 UI
+if !acc.id.is_empty() && !acc.name.is_empty() && (was_idless || was_unnamed) {
     event_tx.send_async(ProviderEvent::ToolUseStart {
-        id: acc.id.clone(),   // ← 这次可能是真实 id
+        id: acc.id.clone(),
         name: acc.name.clone(),
     }).await?;
 }
 ```
 
-修改后 SSE 流式时序：
-1. Delta 1: `{"name":"bash"}` → ToolUseStart(id="", name="bash") ✅ UI 开始跟踪
-2. Delta 2: `{"id":"call_xxx"}` → ToolUseStart(id="call_xxx", name="bash") ✅ UI 更新 id
-3. 工具完成 → ToolDone(id="call_xxx") ✅ 匹配，UI 停止 spinner
+---
+
+## 修复 4：UI 层去重
+
+- **提交**: `aab2c9d`
+
+### 问题
+
+`ToolPending`（SSE 前向器）和 `ToolStart`（tool dispatch）来自不同 async 任务，到达 UI 的顺序不确定。当 `ToolStart` 先到时创建条目，随后 `ToolPending` 又创建一条重复条目，`ToolDone` 通过 `rfind` 只解决后一条。
+
+### 修复
+
+```rust
+pub fn tool_pending(&mut self, id: String, name: &str) {
+    if self.messages.iter().any(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == id)) {
+        return;  // 跳过重复
+    }
+    // ... 创建新条目
+}
+```
+
+---
+
+## 修复 5（真正的根因）：防止 id 被空字符串覆盖
+
+- **提交**: `e7a1278`
+- **改动**: `maki-providers/src/providers/openai_compat.rs` +1/-1 行
+- **测试**: `sse_shangtang_subsequent_empty_id_and_name`
+
+### 问题
+
+**这是整个问题链的最终根因。** 商汤 API 的 SSE 行为：
+
+- **首帧**：给出正确的 `id` 和 `name`
+  ```json
+  {"id":"call_abc","type":"function","function":{"name":"bash","arguments":""}}
+  ```
+- **后续每一帧**：都发 `id=""` 和 `name=""`（重置）
+  ```json
+  {"id":"","type":"","function":{"name":"","arguments":"{\"command\":"}}
+  ```
+
+修复 2 已经保护了 `name` 不被覆盖，但 `id` 没有保护——第 2 帧的 `id=""` 把首帧的正确 id 覆盖了。
+
+### 连锁反应
+
+1. 首帧 → `acc.id = "call_abc"` → `ToolUseStart(id="call_abc")` 发送 ✅
+2. 第 2 帧 → `acc.id = ""`（被覆盖）❌
+3. 流结束 → `ContentBlock::ToolUse.id = "maki_unnamed_0"`（占位符）
+4. `ToolStart(id="maki_unnamed_0")` → 创建新条目
+5. `ToolDone(id="maki_unnamed_0")` → 解决新条目
+6. **旧条目 `call_abc` 永远旋转** ⠹
+
+### 修复
+
+```diff
+-                if let Some(id) = tc.id {
+-                    acc.id = id;
+-                }
++                if let Some(id) = tc.id {
++                    // Same guard as name
++                    if !id.is_empty() || acc.id.is_empty() {
++                        acc.id = id;
++                    }
++                }
+```
 
 ---
 
@@ -141,29 +177,24 @@ if (was_unnamed && is_named) || (was_idless && has_id && is_named) {
 
 | 文件 | 改动 |
 |------|------|
-| `maki-providers/src/providers/openai_compat.rs` | +28/-4 行（3 次提交累计） |
+| `maki-providers/src/providers/openai_compat.rs` | 约 +60/-8 行（6 次提交，含 6 个新测试） |
+| `maki-ui/src/components/messages/mod.rs` | +12 行（去重 + 调试日志） |
+| `docs/2026-07-18-shangtang-fix.md` | 本文件 |
 
-### 最终代码（关键部分）
+### 最终代码（关键部分：`parse_sse` 中的 tool call 累加器逻辑）
 
-**结构体**（约 364-370 行）：
-```rust
-struct ToolCallDelta {
-    index: usize,
-    id: Option<String>,
-    name: Option<String>,
-    function: Option<FunctionDelta>,
-}
-```
-
-**解析逻辑**（约 594-627 行）：
 ```rust
 let acc = &mut tool_accumulators[tc.index];
 let was_unnamed = acc.name.is_empty();
 let was_idless = acc.id.is_empty();
 
+// 保护 id：后续 delta 的 id="" 不能覆盖正确的 id
 if let Some(id) = tc.id {
-    acc.id = id;
+    if !id.is_empty() || acc.id.is_empty() {
+        acc.id = id;
+    }
 }
+// 保护 name：后续 delta 的 name="" 不能覆盖正确的 name
 if let Some(func) = tc.function {
     if let Some(name) = func.name.as_ref() {
         if !name.is_empty() || acc.name.is_empty() {
@@ -174,15 +205,68 @@ if let Some(func) = tc.function {
         acc.arguments.push_str(&args);
     }
 }
+// Fallback：部分 API 把 name 放 tool_calls[i].name 顶层
 if acc.name.is_empty() && let Some(name) = tc.name.as_ref() {
     acc.name = name.clone();
 }
-let is_named = !acc.name.is_empty();
-let has_id = !acc.id.is_empty();
-if (was_unnamed && is_named) || (was_idless && has_id && is_named) {
+// 只在 id 和 name 都已知时才通知 UI
+if !acc.id.is_empty() && !acc.name.is_empty() && (was_idless || was_unnamed) {
     event_tx.send_async(ProviderEvent::ToolUseStart {
         id: acc.id.clone(),
         name: acc.name.clone(),
     }).await?;
 }
 ```
+
+---
+
+## 经验总结
+
+### 商汤 API 的 SSE 特征
+
+首帧：
+```json
+{"id":"call_abc","type":"function","function":{"name":"bash","arguments":""}}
+```
+后续每一帧：
+```json
+{"id":"","type":"","function":{"name":"","arguments":"..."}
+```
+
+特征：**首帧给正确值，后续每帧发空串"重置"**。标准 OpenAI API 在后续帧中会省略 `id` 和 `name` 字段（`null`/不发送），而商汤 API 显式发送 `""`。
+
+### 调试方法
+
+```bash
+RUST_LOG=maki_providers=debug maki
+```
+
+日志中搜索 `SSE tool_call chunk` 可查看原始 SSE 数据，对比标准格式即可定位差异。
+
+### 测试策略
+
+mock 测试（`parse_sse` + flume channel 验证 `ToolUseStart` 事件）可以有效验证解析逻辑，无需启动完整 TUI：
+
+```rust
+let (tx, rx) = flume::unbounded();
+let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TIMEOUT).await.unwrap();
+
+let tools: Vec<_> = resp.message.tool_uses().collect();
+assert_eq!(tools[0].1, "bash");
+
+let starts: Vec<_> = rx.drain().filter_map(...).collect();
+assert_eq!(starts.len(), 1);
+assert_eq!(starts[0], ("call_abc".into(), "bash".into()));
+```
+
+### 最终修复总结
+
+| 层次 | 改动 | 行数 | 问题 |
+|------|------|------|------|
+| **解析层** | `ToolCallDelta` 加 `name` + fallback | +8 | name 不在 `function.name` |
+| **解析层** | `name` 防 `""` 覆盖 | +13/-3 | 后续帧 `name=""` |
+| **解析层** | `ToolUseStart` 等待 id+name 就绪 | +5/-6 | 空 id 发送通知 |
+| **解析层** | `id` 防 `""` 覆盖 | +1 | **真正的根因** |
+| **UI 层** | `tool_pending` 去重 | +10 | 竞态重复条目 |
+| **解析层** | SSE 原始数据日志 | +2 | 调试用 |
+| **测试** | 6 个 mock 测试（~170 行） | +210 | 覆盖所有非标准格式 |
