@@ -185,3 +185,35 @@ if !acc.id.is_empty() && !acc.name.is_empty() && (was_idless || was_unnamed) {
 ### 文件位置
 
 `maki-providers/src/providers/openai_compat.rs`
+
+## 修复 4：UI 层去重，解决跨任务竞态条件
+
+- **提交**: `aab2c9d`
+- **改动**: `maki-ui/src/components/messages/mod.rs` +10 行
+
+### 问题
+
+`ToolPending`（SSE 前向器发送）和 `ToolStart`（tool dispatch 发送）来自不同 async 任务，到达 UI 的顺序不确定。
+
+当 `ToolStart` 先到 → `tool_start()` 通过 fallback 创建 `InProgress` 条目 `A`；随后 `ToolPending` 到 → `tool_pending()` 无脑创建第二条 `B`；`ToolDone` 通过 `rfind` 只匹配最后一条 `B` 并标记完成，条目 `A` 永远旋转。
+
+### 修复
+
+```rust
+pub fn tool_pending(&mut self, id: String, name: &str) {
+    // 如果该 id 已有条目（已被 ToolStart 先创建），跳过
+    if self.messages.iter().any(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == id)) {
+        return;
+    }
+    self.flush();
+    // ... 创建新条目
+}
+```
+
+### 改动文件汇总
+
+| 文件 | 行数 |
+|------|------|
+| `maki-providers/src/providers/openai_compat.rs` | ~210 行（含 5 个 mock 测试） |
+| `maki-ui/src/components/messages/mod.rs` | +10 行 |
+| `docs/2026-07-18-shangtang-fix.md` | 本文件 |
