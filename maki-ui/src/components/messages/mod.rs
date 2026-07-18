@@ -156,6 +156,16 @@ impl MessagesPanel {
     }
 
     pub fn tool_pending(&mut self, id: String, name: &str) {
+        // Avoid duplicates: ToolStart may have already created an entry
+        // via its fallback path (race: ToolPending and ToolStart arrive
+        // in any order from different async tasks).
+        if self
+            .messages
+            .iter()
+            .any(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == id))
+        {
+            return;
+        }
         self.flush();
         let role = DisplayRole::Tool(Box::new(ToolRole {
             id,
