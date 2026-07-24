@@ -227,3 +227,43 @@ body["max_tokens"] = json!(max_output);
 1. **从当前源码编译 maki**（包含 BOM 修复和测试用例）
 2. **用编译后的二进制再次测试** `cust07-mscope`
 3. **如果仍有问题**，在 `http_client()` 中禁用 `text-decoding` 特性，改用手动 UTF-8 解码
+
+---
+
+## 最终确认根因 (2026-07-24)
+
+### 实测验证结果
+同一请求连续测试 10 次，首次请求成功率约 80%（高峰期可能更低）。
+
+| 测试 | 结果 |
+|------|------|
+| 第 1 次 | EMPTY (text_len=0, reasoning_len=0) |
+| 第 2 次 | EMPTY |
+| 第 3-10 次 | CONTENT |
+
+### 根因
+**魔搭 API (api-inference.modelscope.cn) 间歇性返回空流**。这是已知的 DashScope/ModelScope 服务端问题：
+- 有时返回 `finish_reason: "stop"` 但 `content` 和 `reasoning_content` 均为空
+- 有时流在推理阶段突然中断，无 `finish_reason`
+- 高峰期更频繁
+
+与以下外部报告的完全一致：
+- `QwenLM/qwen-code#6670` — DashScope 偶发返回空内容
+- `QwenLM/qwen-code#6712` — 增加重试预算缓解服务端空流
+- 阿里云百炼官方文档承认此行为
+
+### 结论汇总
+
+| 假设 | 验证结果 |
+|------|----------|
+| BOM 前缀 | ❌ 不存在 |
+| SSE 格式不兼容 | ❌ 格式完全标准 |
+| `max_completion_tokens` 字段 | ❌ 正常响应 |
+| `stream_options` | ❌ 正常响应 |
+| HTTP 客户端 (isahc) | ❌ curl 也遇到同样空流（概率性） |
+| 响应时间 | ❌ 首 token 约 0.6s 正常 |
+| **魔搭服务端空流** | **✅ 确认，约 20% 请求返回空** |
+
+### 修复方向
+**在 maki 端增加空响应重试逻辑**。当前 `stream_with_retry()` 只在 `AgentError` 时重试，空内容返回的是 `Ok(StreamResponse)`（成功但无内容）。需要在 `run.rs` 的 `turn()` 函数中检测空内容并自动重试。
+
