@@ -267,3 +267,47 @@ body["max_tokens"] = json!(max_output);
 ### 修复方向
 **在 maki 端增加空响应重试逻辑**。当前 `stream_with_retry()` 只在 `AgentError` 时重试，空内容返回的是 `Ok(StreamResponse)`（成功但无内容）。需要在 `run.rs` 的 `turn()` 函数中检测空内容并自动重试。
 
+
+---
+
+## 最终根因确认 (2026-07-24 第二次验证)
+
+### 实际响应内容
+魔搭 API 在部分请求中返回 **HTTP 200 + 仅含 `data: [DONE]` 的空 SSE 流**：
+
+```
+HTTP/1.1 200 OK
+...
+
+data: [DONE]
+```
+
+整个响应体只有 `data: [DONE]`，没有 `choices`、没有 `content`、没有 `reasoning_content`、没有 `finish_reason`。maki 的 SSE 解析器遇到 `[DONE]` 立即终止循环，返回空 `StreamResponse`。
+
+### 与 429 限流的区别
+
+| 情况 | HTTP 状态 | 响应体 | maki 行为 |
+|------|-----------|--------|-----------|
+| 模型速率限制 | 429 | `{"error":{"code":"limit_burst_rate",...}}` | 正确返回 `AgentError`，触发重试 |
+| 每日配额超限 | 429 | `{"error":{"message":"exceeded today's quota",...}}` | 同上，触发重试 |
+| **服务端空流** | **200** | **`data: [DONE]` (仅此而已)** | **静默返回空内容，无错误** |
+
+### 完整调用链
+```
+maki --print -p "hi"
+  → OpenAi::stream_message()
+    → OpenAiCompatProvider::do_stream()
+      → POST /chat/completions → HTTP 200
+      → parse_sse(BufReader::new(body))
+        → 第一行: data: [DONE] → break  ← 立即遇到结束信号
+        → 返回 StreamResponse { content: [], stop_reason: None, usage: default }
+  → Agent::turn()
+    → response.message.content 为空
+    → has_tools = false, has_text = false
+    → history.push(空消息)
+    → TurnOutcome::Done(stop_reason=None)
+  → print.rs: result_text = "" → 输出空
+```
+
+### 为什么概率出现
+魔搭的模型按分钟/天配额限流，当后端实例无空闲或模型加载失败时，不返回错误而是直接发 `[DONE]`。高峰期出现概率更高。
