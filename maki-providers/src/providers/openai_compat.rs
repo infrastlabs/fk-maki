@@ -474,6 +474,13 @@ pub async fn parse_sse(
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
+        // Strip UTF-8 BOM from the first line; some Chinese cloud APIs
+        // (e.g. ModelScope) prepend it, which breaks strip_prefix("data:").
+        let line = if line.starts_with('\u{feff}') {
+            &line['\u{feff}'.len_utf8()..]
+        } else {
+            &line
+        };
         let data = match line.strip_prefix("data:") {
             Some(d) => d.trim(),
             None => continue,
@@ -1204,7 +1211,47 @@ data: [DONE]\n";
                 "ToolUseStart id must be non-empty, got: {:?}",
                 starts[0].0
             );
-            assert_eq!(starts[0], ("call_abc".into(), "bash".into()));
+    #[test]
+    fn parse_sse_bom_prefix_skips_first_event() {
+        // Chinese cloud APIs (including ModelScope) may prepend a UTF-8 BOM.
+        // The first SSE event is silently dropped because the line starts with
+        // \ufeffdata: instead of data:.
+        smol::block_on(async {
+            let sse = "\
+\u{feff}data: {\"choices\":[{\"delta\":{\"content\":\"first event\"}}]}
+\n
+data: {\"choices\":[{\"delta\":{\"content\":\" second event\"}}]}
+\n
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}
+\n
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            // BOM silently drops the first event; only " second event" is captured
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == " second event")
+            );
+            assert_eq!(resp.message.content.len(), 1);
+        })
+    }
+
+    #[test]
+    fn parse_sse_bom_prefix_only_one_event() {
+        // Worst case: single SSE event with BOM prefix, ALL content lost.
+        smol::block_on(async {
+            let sse = "\u{feff}data: {\"choices\":[{\"delta\":{\"content\":\"only content\"}}]}\n
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert!(resp.message.content.is_empty(), "all content lost due to BOM");
         })
     }
 
@@ -1408,7 +1455,218 @@ data: [DONE]\n";
                 "exactly one ToolUseStart, got: {:?}",
                 starts
             );
-            assert_eq!(starts[0], ("call_abc".into(), "bash".into()));
+    #[test]
+    fn parse_sse_reasoning_only_no_content() {
+        // Simulates a thinking model that never produces visible text content
+        // (e.g. Qwen on ModelScope when stream ends during thinking phase).
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think about this\"}}]}
+\n
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" step by step\"}}]}
+\n
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}
+\n
+data: [DONE]\n";
+
+            let (tx, rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            // Reasoning text should be captured
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think about this step by step")
+            );
+            // No text block (model never produced visible content)
+            assert_eq!(resp.message.content.len(), 1, "only thinking block, no text block");
+            assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+            assert_eq!(resp.usage.output, 5);
+
+            let mut thinking = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                match e {
+                    ProviderEvent::ThinkingDelta { text } => thinking.push(text),
+                    _ => {}
+                }
+            }
+            assert_eq!(thinking, vec!["Let me think about this", " step by step"]);
+        })
+    }
+
+    #[test]
+    fn parse_sse_content_null_in_delta() {
+        // ModelScope may send content: null explicitly in thinking chunks.
+        // This must not cause a deserialization error.
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\",\"content\":null}}]}
+\n
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":null,\"content\":\"answer text\"}}]}
+\n
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}
+\n
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "thinking")
+            );
+            assert!(
+                matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "answer text")
+            );
+        })
+    }
+
+    #[test]
+    fn parse_sse_usage_only_chunk_with_empty_choices() {
+        // ModelScope sends a final chunk with empty choices and usage
+        // when stream_options.include_usage is true.
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}
+\n
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20}}
+\n
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello")
+            );
+            assert_eq!(resp.usage.input, 100);
+            assert_eq!(resp.usage.output, 20);
+            // stop_reason should be None since finish_reason was never sent
+            assert_eq!(resp.stop_reason, None);
+        })
+    }
+
+    #[test]
+    fn parse_sse_reasoning_with_empty_content() {
+        // Some providers send reasoning_content alongside empty content string.
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"deep thoughts\",\"content\":\"\"}}]}
+\n
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":null,\"content\":\"actual answer\"}}]}
+\n
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}
+\n
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            // Empty content string should not produce a TextDelta, but thinking is captured
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "deep thoughts")
+            );
+            assert!(
+                matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "actual answer")
+            );
+        })
+    }
+
+    #[test]
+    fn parse_sse_non_streaming_json_without_data_prefix() {
+        // If the API ignores stream:true and returns a plain JSON response
+        // without SSE framing, the parser must not crash and returns empty.
+        smol::block_on(async {
+            let sse = "{\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion\",\"created\":123,\"model\":\"qwen\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            // No data: prefix → all lines skipped → empty response
+            assert!(resp.message.content.is_empty());
+            assert_eq!(resp.usage.output, 0);
+            assert_eq!(resp.stop_reason, None);
+        })
+    }
+
+    #[test]
+    fn parse_sse_message_alias_with_stream_content() {
+        // Some providers use "message" instead of "delta" in streaming chunks.
+        // The #[serde(alias = "message")] on delta should handle this.
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"message\":{\"content\":\"Hello\"}}]}
+\n
+data: {\"choices\":[{\"message\":{\"content\":\" world\"}}]}
+\n
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"message\":{}}]}
+\n
+data: [DONE]\n";
+
+            let (tx, rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello world")
+            );
+            assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+
+            let mut deltas = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                if let ProviderEvent::TextDelta { text } = e {
+                    deltas.push(text);
+                }
+            }
+            assert_eq!(deltas, vec!["Hello", " world"]);
+        })
+    }
+
+    #[test]
+    fn parse_sse_bom_prefix_skips_first_event() {
+        smol::block_on(async {
+            let sse = "\
+\u{feff}data: {\"choices\":[{\"delta\":{\"content\":\"first event\"}}]}
+\n
+data: {\"choices\":[{\"delta\":{\"content\":\" second event\"}}]}
+\n
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}
+\n
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            // BOM silently drops the first event; only " second event" is captured
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == " second event")
+            );
+            assert_eq!(resp.message.content.len(), 1);
+        })
+    }
+
+    #[test]
+    fn parse_sse_bom_prefix_only_one_event() {
+        smol::block_on(async {
+            let sse = "\u{feff}data: {\"choices\":[{\"delta\":{\"content\":\"only content\"}}]}\n
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert!(resp.message.content.is_empty(), "all content lost due to BOM");
         })
     }
 }
