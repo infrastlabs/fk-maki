@@ -311,3 +311,51 @@ maki --print -p "hi"
 
 ### 为什么概率出现
 魔搭的模型按分钟/天配额限流，当后端实例无空闲或模型加载失败时，不返回错误而是直接发 `[DONE]`。高峰期出现概率更高。
+
+---
+
+## 修复方案与进展 (2026-07-24)
+
+### 修复内容
+
+**在 `parse_sse()` 末尾检测空流**（`openai_compat.rs:701-710`）：
+
+```rust
+if content_blocks.is_empty() {
+    let reason = stop_reason.map(|s| s.to_string()).unwrap_or_default();
+    return Err(AgentError::Api {
+        status: 502,  // 502 触发自动重试（>=500）
+        message: format!("model returned empty stream (stop_reason: {reason})"),
+    });
+}
+```
+
+**工作原理**：
+1. SSE 解析完成后，如果 `content_blocks` 为空（无 text、thinking、tool_use）
+2. 返回 `AgentError::Api { status: 502 }` 
+3. `stream_with_retry()` 判定 502 >= 500 → 可重试
+4. 自动重试（指数退避：2s, 4s, 8s, ... 最大 10 次）
+5. 重试成功 → 正常返回；全失败 → 报错提示
+
+### 验证结果
+
+| 场景 | 结果 |
+|------|------|
+| 魔搭 Qwen 返回空 `[DONE]` 流 | 检测到空流，返回 `AgentError` |
+| 重试机制 | 502 状态码触发 `stream_with_retry()` 自动重试 |
+| 重试耗尽 | 输出错误信息而非静默空内容 |
+
+### 分支提交历史
+
+| 提交 | 描述 |
+|------|------|
+| `a51864f6` | 初始调查记录文档 |
+| `dd6b9380` | BOM 剥离 + 8 个 SSE 测试用例 |
+| `387360b7` | 验证结论（BOM 排除） |
+| `25e80f63` | 确认根因为 `data: [DONE]` 空流 |
+| `b33693fa` | 空流检测 → 返回 `AgentError` |
+| `d9aec840` | 502 状态码触发自动重试 |
+
+### 剩余工作
+- [ ] 编译发布版二进制部署到 `/usr/local/bin`
+- [ ] 长期：魔搭服务端修复空流问题（非 maki 控制）
