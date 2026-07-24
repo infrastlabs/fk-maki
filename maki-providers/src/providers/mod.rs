@@ -7,7 +7,7 @@ use futures_lite::io::AsyncBufRead;
 use isahc::config::Configurable;
 use isahc::http::request::Builder;
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, trace, warn};
 
 use crate::AgentError;
 
@@ -146,18 +146,23 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
     stream_timeout: Duration,
 ) -> Result<Option<String>, AgentError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
+    trace!(?remaining, "[SSE] next_sse_line: waiting for line");
     let result = futures_lite::future::or(
         async { lines.next().await.transpose().map_err(AgentError::from) },
         async {
             smol::Timer::after(remaining).await;
+            debug!(stream_timeout = stream_timeout.as_secs(), "[SSE] next_sse_line: TIMEOUT");
             Err(AgentError::Timeout {
                 secs: stream_timeout.as_secs(),
             })
         },
     )
     .await;
-    if let Ok(Some(_)) = &result {
+    if let Ok(Some(line)) = &result {
         *deadline = Instant::now() + stream_timeout;
+        trace!(len = line.len(), "[SSE] next_sse_line: got line");
+    } else if result.is_err() {
+        debug!("[SSE] next_sse_line: error or None (end of stream)");
     }
     result
 }

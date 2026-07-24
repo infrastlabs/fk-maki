@@ -274,17 +274,28 @@ impl<'h> Agent<'h> {
 
         let has_tools = response.message.has_tool_calls();
         let stop_reason = response.stop_reason;
+        let content_block_count = response.message.content.len();
+        let text_content = response.message.first_text_content();
         info!(
             input_tokens = response.usage.input,
             output_tokens = response.usage.output,
             cache_creation = response.usage.cache_creation,
             cache_read = response.usage.cache_read,
             has_tools,
+            content_block_count,
+            text_len = text_content.map_or(0, |t| t.len()),
             self.num_turns,
             model = %self.model.id,
             stop_reason = stop_reason.map_or("none", Into::into),
-            "API response received"
+            "[TURN] API response received"
         );
+
+        if content_block_count == 0 {
+            warn!(
+                self.num_turns,
+                "[TURN] EMPTY response - no content blocks!"
+            );
+        }
 
         self.emit_turn_complete(&response)?;
         let usage = response.usage;

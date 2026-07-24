@@ -172,14 +172,29 @@ impl OpenAiCompatProvider {
 
         let response = self.client.send_async(request).await?;
         let status = response.status().as_u16();
+        debug!("[SSE] response status: {}", status);
 
         if status == 200 {
-            parse_sse(
+            match parse_sse(
                 BufReader::new(response.into_body()),
                 event_tx,
                 self.stream_timeout,
             )
             .await
+            {
+                Ok(resp) => {
+                    debug!(
+                        text_len = resp.message.first_text_content().map_or(0, |t| t.len()),
+                        content_blocks = resp.message.content.len(),
+                        "[SSE] parse_sse Ok"
+                    );
+                    Ok(resp)
+                }
+                Err(e) => {
+                    debug!(error = %e, "[SSE] parse_sse error");
+                    Err(e)
+                }
+            }
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -659,6 +674,11 @@ pub async fn parse_sse(
         }
     }
 
+    // Record lengths before content_blocks assembly (which moves the values)
+    let final_text_len = text.len();
+    let final_reasoning_len = reasoning_text.len();
+    let final_tool_count = tool_accumulators.len();
+
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
     if !reasoning_text.is_empty() {
@@ -703,11 +723,25 @@ pub async fn parse_sse(
     // Treat this as an error so the retry layer can re-request.
     if content_blocks.is_empty() {
         let reason = stop_reason.map(|s| s.to_string()).unwrap_or_default();
+        warn!(
+            text_len = final_text_len,
+            reasoning_len = final_reasoning_len,
+            tool_count = final_tool_count,
+            stop_reason = %reason,
+            "[SSE] EMPTY STREAM - returning 502 for retry"
+        );
         return Err(AgentError::Api {
             status: 502,
             message: format!("model returned empty stream (stop_reason: {reason})"),
         });
     }
+
+    debug!(
+        text_len = final_text_len,
+        reasoning_len = final_reasoning_len,
+        content_block_count = content_blocks.len(),
+        "[SSE] parse_sse returning Ok"
+    );
 
     Ok(StreamResponse {
         message: Message {

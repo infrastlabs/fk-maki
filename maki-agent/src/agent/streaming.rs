@@ -3,7 +3,7 @@ use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions, StreamResponse};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender};
@@ -46,7 +46,10 @@ pub(crate) async fn stream_with_retry(
     let messages = maki_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
     let mut retry = RetryState::new();
+    let mut attempt_num: u32 = 0;
     loop {
+        attempt_num += 1;
+        debug!(attempt = attempt_num, model = %model.id, "[RETRY] attempt {attempt_num}");
         let (ptx, prx) = flume::unbounded();
         let forwarder = smol::spawn({
             let event_tx = event_tx.clone();
@@ -63,7 +66,10 @@ pub(crate) async fn stream_with_retry(
         drop(ptx);
         let _ = forwarder.await;
         match result {
-            Ok(r) => return Ok(r),
+            Ok(r) => {
+                debug!(attempt = attempt_num, "[RETRY] success on attempt {attempt_num}");
+                return Ok(r);
+            }
             Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
             Err(e) if e.is_retryable() => {
                 if e.should_rotate_key()
@@ -73,10 +79,11 @@ pub(crate) async fn stream_with_retry(
                 }
                 let (attempt, delay) = retry.next_delay();
                 if matches!(e, AgentError::Timeout { .. }) && attempt > MAX_TIMEOUT_RETRIES {
+                    warn!(attempt, error = %e, "[RETRY] max retries exhausted");
                     return Err(e);
                 }
                 let delay_ms = delay.as_millis() as u64;
-                warn!(attempt, delay_ms, error = %e, "retryable, will retry");
+                warn!(attempt, delay_ms, error = %e, "[RETRY] retrying after error");
                 event_tx.send(AgentEvent::Retry {
                     attempt,
                     message: e.retry_message(),
@@ -93,7 +100,10 @@ pub(crate) async fn stream_with_retry(
                     return Err(AgentError::Cancelled);
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                debug!(error = %e, "[RETRY] non-retryable error");
+                return Err(e);
+            }
         }
     }
 }
