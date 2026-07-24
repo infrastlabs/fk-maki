@@ -198,3 +198,32 @@ body["max_tokens"] = json!(max_output);
 ---
 
 记录日期：2026-07-24
+
+---
+
+## 实测验证结论 (2026-07-24)
+
+### 确认排除的根因
+1. ✅ **BOM 前缀** — 魔搭响应无 BOM，第一字节为 `data:`
+2. ✅ **SSE 格式** — 标准 OpenAI 格式，`data: [DONE]` 结束，maki 解析器能正确处理
+3. ✅ **请求体字段** — `max_completion_tokens` / `stream_options` / `max_tokens` 均可正常工作
+4. ✅ **响应时间** — 首次 token 约 0.6s，远低于 low_speed_timeout (30s)
+5. ✅ **认证** — 脚本 resolve 正常返回，curl 使用同一 token 能获取内容
+6. ✅ **模型 ID** — `deepseek-ai/DeepSeek-V4-Flash`、`Qwen/Qwen3.5-35B-A3B` 等均通过 curl 正常返回
+
+### 确认的问题表现
+- `maki -m cust07-mscope/<model> -p "hi"` → **退出码 0，无任何输出**（stdout/stderr 均为空）
+- `maki -m cust06-ocfree/deepseek-v4-flash-free -p "hi"` → **正常工作**，输出 "Hello."
+- 两个 provider 都使用 `base: "openai"`，走同一套代码路径
+- 部分模型（GLM-4.7-Flash）调用时 maki 超时挂起（exit 124），部分模型（DeepSeek-V4-Flash）立即返回空
+
+### 最可能根因
+**isahc HTTP 客户端与魔搭 API 的流式响应不兼容**。具体可能原因：
+1. `isahc` 1.7 的 `text-decoding` 特性对 `Content-Type: text/event-stream` 的处理方式
+2. 魔搭使用 `Transfer-Encoding: chunked` 的某些特征触发了 isahc 的内部缓冲
+3. 响应中包含的 `Set-Cookie` 或其他头部影响了 isahc 的连接处理
+
+### 下一步建议
+1. **从当前源码编译 maki**（包含 BOM 修复和测试用例）
+2. **用编译后的二进制再次测试** `cust07-mscope`
+3. **如果仍有问题**，在 `http_client()` 中禁用 `text-decoding` 特性，改用手动 UTF-8 解码
