@@ -293,4 +293,67 @@ RUST_LOG=maki_providers=debug maki -m cust07-mscope/Qwen/Qwen3.5-35B-A3B -p "Hel
 
 ---
 
-记录日期：2026-07-24（补充）
+## 补充：Python 模拟测试结果
+
+### 测试方式
+
+由于 isahc 编译需要 OpenSSL dev 头文件（环境缺失），改用 Python urllib 进行轻量级验证。
+
+测试脚本：`maki-mock/test_mscope.py`
+
+### 测试结果
+
+| 配置 | 首 token | 总耗时 | 结果 |
+|------|---------|--------|------|
+| read_timeout=30s (模拟 low_speed_timeout) | 0.6s | 8.8s | ✅ 343 chunks |
+| read_timeout=None (模拟移除) | 0.5s | 10.6s | ✅ 366 chunks |
+
+### 结论
+
+**当前时刻两种配置都正常返回内容**。
+
+1. **Qwen3.5-35B-A3B 首 token < 1s**，远低于 30s 阈值，`low_speed_timeout` 未触发
+2. **问题不是必然复现的** — 与先前调查一致（间歇性，约 20%）
+3. **可能的触发条件**：高峰期模型加载慢/首 token > 30s、更大/更慢的模型、网络抖动
+
+### low_speed_timeout 移除的性质
+
+- **防御性修复** — 消除潜在风险，无副作用（300s `stream_timeout` 仍然生效）
+- 当前测试**不能证明**这是根因（条件没触发），但也**不能排除**
+- 需要高峰期/慢模型/多次调用才能验证
+
+---
+
+## 已提交的改动
+
+### `maki-providers/src/providers/mod.rs`
+
+```rust
+pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
+    isahc::HttpClient::builder()
+        .connect_timeout(timeouts.connect)
+        // NOTE: low_speed_timeout removed — it silently closes connections
+        // when a model takes >30s to produce the first token (e.g. ModelScope
+        // large models during thinking phase).
+        .build()
+        .expect("failed to build HTTP client")
+}
+```
+
+### `maki-providers/src/providers/openai_compat.rs`
+
+修复了 5 个因"空流→502"修复而失效的测试 + 移除重复测试块。
+
+**测试结果**：471 passed, 0 failed
+
+### 提交历史
+
+| 提交 | 描述 |
+|------|------|
+| `0cbe1d97` | fix(providers): remove isahc low_speed_timeout |
+| `8176d520` | docs: add Shangtang fix comparison insights |
+| `9c6fb71b` | docs: ModelScope isahc vs reqwest root cause analysis |
+
+---
+
+记录日期：2026-07-24（补充 Python 测试结果）
