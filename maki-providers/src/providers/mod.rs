@@ -29,7 +29,6 @@ pub(crate) mod synthetic;
 pub(crate) mod tensorx;
 pub(crate) mod zai;
 
-const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 
 pub(crate) fn user_agent() -> &'static str {
     concat!(
@@ -166,7 +165,10 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
 pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
     isahc::HttpClient::builder()
         .connect_timeout(timeouts.connect)
-        .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
+        // NOTE: low_speed_timeout removed — it silently closes connections
+        // when a model takes >30s to produce the first token (e.g. ModelScope
+        // large models during thinking phase). See docs/superpowers/records/
+        // 2026-07-24-1400-modelscope-isahc-vs-reqwest-analysis.md
         .build()
         .expect("failed to build HTTP client")
 }

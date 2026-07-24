@@ -767,6 +767,8 @@ data: [DONE]\n";
     fn parse_sse_deepseek_cache_hit_tokens() {
         smol::block_on(async {
             let sse = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
+\n\
 data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":80,\"prompt_cache_miss_tokens\":20}}\n\
 \n\
 data: [DONE]\n";
@@ -1118,15 +1120,17 @@ data: [DONE]\n";
 
     #[test]
     fn parse_sse_empty_stream() {
+        // Empty stream (only data: [DONE]) returns 502 to trigger retry.
         smol::block_on(async {
             let sse = "data: [DONE]\n";
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let err = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
                 .await
-                .unwrap();
-            assert!(resp.message.content.is_empty());
-            assert_eq!(resp.usage, TokenUsage::default());
-            assert_eq!(resp.stop_reason, None);
+                .unwrap_err();
+            match err {
+                AgentError::Api { status: 502, .. } => {}
+                other => panic!("expected 502 error, got: {other:?}"),
+            }
         })
     }
 
@@ -1228,8 +1232,7 @@ data: [DONE]\n";
     #[test]
     fn parse_sse_bom_prefix_skips_first_event() {
         // Chinese cloud APIs (including ModelScope) may prepend a UTF-8 BOM.
-        // The first SSE event is silently dropped because the line starts with
-        // \ufeffdata: instead of data:.
+        // The BOM stripping logic removes it, so all events are captured.
         smol::block_on(async {
             let sse = "\
 \u{feff}data: {\"choices\":[{\"delta\":{\"content\":\"first event\"}}]}
@@ -1245,17 +1248,17 @@ data: [DONE]\n";
                 .await
                 .unwrap();
 
-            // BOM silently drops the first event; only " second event" is captured
+            // BOM is stripped; both events are captured
+            assert_eq!(resp.message.content.len(), 1); // single text block
             assert!(
-                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == " second event")
+                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "first event second event")
             );
-            assert_eq!(resp.message.content.len(), 1);
         })
     }
 
     #[test]
     fn parse_sse_bom_prefix_only_one_event() {
-        // Worst case: single SSE event with BOM prefix, ALL content lost.
+        // Single SSE event with BOM prefix: BOM is stripped, content is captured.
         smol::block_on(async {
             let sse = "\u{feff}data: {\"choices\":[{\"delta\":{\"content\":\"only content\"}}]}\n
 data: [DONE]\n";
@@ -1265,7 +1268,10 @@ data: [DONE]\n";
                 .await
                 .unwrap();
 
-            assert!(resp.message.content.is_empty(), "all content lost due to BOM");
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "only content")
+            );
+            assert_eq!(resp.message.content.len(), 1);
         })
     }
 
@@ -1597,19 +1603,18 @@ data: [DONE]\n";
     #[test]
     fn parse_sse_non_streaming_json_without_data_prefix() {
         // If the API ignores stream:true and returns a plain JSON response
-        // without SSE framing, the parser must not crash and returns empty.
+        // without SSE framing, the parser returns 502 (empty stream).
         smol::block_on(async {
             let sse = "{\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion\",\"created\":123,\"model\":\"qwen\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            let err = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
                 .await
-                .unwrap();
-
-            // No data: prefix → all lines skipped → empty response
-            assert!(resp.message.content.is_empty());
-            assert_eq!(resp.usage.output, 0);
-            assert_eq!(resp.stop_reason, None);
+                .unwrap_err();
+            match err {
+                AgentError::Api { status: 502, .. } => {}
+                other => panic!("expected 502 error, got: {other:?}"),
+            }
         })
     }
 
@@ -1644,46 +1649,6 @@ data: [DONE]\n";
                 }
             }
             assert_eq!(deltas, vec!["Hello", " world"]);
-        })
-    }
-
-    #[test]
-    fn parse_sse_bom_prefix_skips_first_event() {
-        smol::block_on(async {
-            let sse = "\
-\u{feff}data: {\"choices\":[{\"delta\":{\"content\":\"first event\"}}]}
-\n
-data: {\"choices\":[{\"delta\":{\"content\":\" second event\"}}]}
-\n
-data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}
-\n
-data: [DONE]\n";
-
-            let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
-
-            // BOM silently drops the first event; only " second event" is captured
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == " second event")
-            );
-            assert_eq!(resp.message.content.len(), 1);
-        })
-    }
-
-    #[test]
-    fn parse_sse_bom_prefix_only_one_event() {
-        smol::block_on(async {
-            let sse = "\u{feff}data: {\"choices\":[{\"delta\":{\"content\":\"only content\"}}]}\n
-data: [DONE]\n";
-
-            let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
-
-            assert!(resp.message.content.is_empty(), "all content lost due to BOM");
         })
     }
 }
