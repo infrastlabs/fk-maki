@@ -1,0 +1,12 @@
+[package]
+name = "sse-parse-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"
+serde_json = "1"
+
+[workspace]
