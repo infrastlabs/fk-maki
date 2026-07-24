@@ -698,6 +698,17 @@ pub async fn parse_sse(
         content_blocks.push(ContentBlock::ToolUse { id, name, input });
     }
 
+    // Some providers (e.g. ModelScope) return HTTP 200 with an SSE stream
+    // that immediately contains only data: [DONE] and no content blocks.
+    // Treat this as an error so the retry layer can re-request.
+    if content_blocks.is_empty() {
+        let reason = stop_reason.map(|s| s.to_string()).unwrap_or_default();
+        return Err(AgentError::Api {
+            status: 200,
+            message: format!("model returned empty stream (stop_reason: {reason})"),
+        });
+    }
+
     Ok(StreamResponse {
         message: Message {
             role: Role::Assistant,
@@ -1211,6 +1222,9 @@ data: [DONE]\n";
                 "ToolUseStart id must be non-empty, got: {:?}",
                 starts[0].0
             );
+        })
+    }
+
     #[test]
     fn parse_sse_bom_prefix_skips_first_event() {
         // Chinese cloud APIs (including ModelScope) may prepend a UTF-8 BOM.
@@ -1455,6 +1469,9 @@ data: [DONE]\n";
                 "exactly one ToolUseStart, got: {:?}",
                 starts
             );
+        })
+    }
+
     #[test]
     fn parse_sse_reasoning_only_no_content() {
         // Simulates a thinking model that never produces visible text content
