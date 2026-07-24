@@ -215,3 +215,82 @@ zerostack --provider custom --base-url https://api-inference.modelscope.cn/v1 \
 ---
 
 记录日期：2026-07-24
+
+---
+
+## 补充分析：商汤 API 修复记录的启发
+
+参考 `docs/2026-07-18-shangtang-fix.md`（商汤 API 兼容性修复），获得重要新启发。
+
+### 1. 相同模式：zerostack 正常，maki 异常
+
+| 维度 | 商汤 API 问题 | ModelScope API 问题 |
+|------|-------------|-------------------|
+| 现象 | 工具调用失败 / UI spinner 永远旋转 | 流式响应为空 / 卡住 |
+| maki 表现 | ❌ 解析失败 | ❌ 无返回 |
+| zerostack 表现 | ✅ 正常 | ✅ 正常 |
+| 根因层级 | **SSE 格式非标准** | **疑似 SSE 格式非标准 + HTTP 客户端不兼容** |
+| 修复方式 | 调整解析器适应非标准格式 | 待解决 |
+
+**关键结论**：两个不同的国产 API 平台，maki 都有问题而 zerostack 都正常。这不是巧合，而是**系统性的架构差异**：
+
+- **zerostack** 使用 `rig` 库的 SSE 解析器，对各种非标准格式兼容性更强
+- **maki** 使用手动的 `parse_sse()` 解析器，对 SSE 格式要求更严格
+
+### 2. 新假设：ModelScope 问题可能是两层问题的叠加
+
+```
+Layer 1: HTTP 连接层（isahc low_speed_timeout）
+    ↓ 如果修复后仍然失败
+Layer 2: SSE 格式层（非标准字段/时序）
+    ↓ 如果修复后仍然失败
+Layer 3: 请求体/认证层（header/body 差异）
+```
+
+**只有先解决连接层问题，才能看到 SSE 数据，进而判断是否存在格式层问题。**
+
+如果连接层修复后：
+- **正常了** → 根因确认是 `low_speed_timeout`
+- **有返回但内容异常** → 需要走商汤同样的路：抓原始 SSE → 对比标准格式 → 调整解析器
+- **仍然卡住** → 可能是 isahc 的其他内部行为（缓冲、连接复用），需要迁移到 reqwest
+
+### 3. 商汤 API 的 SSE 特征（对比参考）
+
+商汤 API 的非标准行为：
+- **首帧**：给出正确的 `id` 和 `name`
+  ```json
+  {"id":"call_abc","type":"function","function":{"name":"bash","arguments":""}}
+  ```
+- **后续每一帧**：都发 `id=""` 和 `name=""`（显式空串"重置"）
+  ```json
+  {"id":"","type":"","function":{"name":"","arguments":"{\"command\":"}}}
+  ```
+
+标准 OpenAI API 在后续帧中会**省略** `id` 和 `name` 字段（`null`/不发送），而商汤 API **显式发送 `""`**。
+
+**ModelScope 是否也有类似的非标准行为？** 需要抓取原始 SSE 数据才能判断。
+
+### 4. 已验证的调试方法论
+
+```bash
+# 开启 providers 模块的 debug 日志
+RUST_LOG=maki_providers=debug maki -m cust07-mscope/Qwen/Qwen3.5-35B-A3B -p "Hello"
+```
+
+日志中搜索 `SSE tool_call chunk` 可查看原始 SSE 数据（已在 `openai_compat.rs:502-504` 添加）。
+
+### 5. 脚本层排除
+
+`cust07-mscope` 和 `cust06-ocfree` 脚本结构完全一致（`base: openai`，仅域名和 key 环境变量不同）。`cust06-ocfree` 正常而 `cust07-mscope` 不正常 → **确认问题不在脚本层**，是 API 服务端行为差异或 HTTP 客户端兼容性。
+
+### 6. 更新后的实施策略
+
+**第一步应该同时做两件事**：
+1. 禁用 `low_speed_timeout` 验证连接层假设
+2. 开启 `RUST_LOG=maki_providers=debug` 抓取 ModelScope 的**原始 SSE 数据**
+
+这样即使连接层修复后仍有问题，也能立即获得 SSE 格式分析数据，不用反复编译测试。
+
+---
+
+记录日期：2026-07-24（补充）
