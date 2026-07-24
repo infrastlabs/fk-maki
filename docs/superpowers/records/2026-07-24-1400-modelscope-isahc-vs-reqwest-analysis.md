@@ -395,4 +395,127 @@ Python 测试中直接读取和缓冲读取都能正常工作（Python socket �
 
 ---
 
+## 补充：isahc 编译测试结果（2026-07-24）
+
+### 测试方式
+
+安装了 `libssl-dev` 后成功编译 isahc 测试程序。
+
+测试脚本：`maki-mock/isahc-sse-test/`
+
+### 测试结果
+
+| 测试 | 配置 | 首字节 | 耗时 | 行数 | 内容块 | 结果 |
+|------|------|--------|------|------|--------|------|
+| 1 | BufReader + low_speed_timeout(1, 30s) | 0.8s | 18.5s | 1473 | 11 | ✅ |
+| 2 | BufReader + 无 low_speed_timeout | 0.7s | 8.3s | 735 | 12 | ✅ |
+| 3 | 直接 lines() + low_speed_timeout | 0.8s | 6.5s | 553 | 8 | ✅ |
+| 4 | 直接 lines() + 无 low_speed_timeout | 0.8s | 3.6s | 227 | 9 | ✅ |
+
+### 结论
+
+**当前环境/时刻所有 4 种组合都正常返回内容。**
+
+1. **`low_speed_timeout` 未触发** — 首字节均 < 1s，远低于 30s 阈值
+2. **`BufReader` 包裹 `AsyncBody` 未导致问题** — 测试 1 和 2 都正常
+3. **问题无法在当前环境复现** — 与用户描述的"必现"不符
+
+### 关键推断
+
+由于外部 API 层已全面排除（Python + isahc 均正常），问题必定在 **maki 独有的代码层**：
+
+---
+
+## 排查方向重大转变：聚焦 maki 自身
+
+### 已全面排除的外部因素
+
+| 假设 | 状态 | 证据 |
+|------|------|------|
+| `low_speed_timeout` | ❌ 排除 | isahc 测试全部正常 |
+| Headers / 请求体 | ❌ 排除 | 各种组合均正常 |
+| isahc BufReader | ❌ 排除 | 4 种配置都正常 |
+| 连接复用 | ❌ 排除 | 服务端返回 connection: close |
+| 通用 HTTP 行为 | ❌ 排除 | Python + isahc 均正常 |
+
+### maki 独有的复杂性（zerostack 没有）
+
+| 层次 | maki | zerostack |
+|------|------|-----------|
+| 运行时 | **smol** | tokio |
+| HTTP 客户端 | **isahc** + 手动配置 | reqwest（通过 rig） |
+| SSE 解析 | **手动 `parse_sse()`** ~260 行 | rig 库内部处理 |
+| 流控 | **自定义 `next_sse_line()` + deadline** | 无 |
+| 重试 | **`stream_with_retry()`** + 指数退避 | 简单重试 |
+| 空流处理 | **检测空 content → 529 → 重试** | 无 |
+| 工具调用后空响应 | **nudge 机制**（推空消息到 history） | 无 |
+| 事件通道 | **flume Sender → 前向到 UI** | 直接回调 |
+
+### 高嫌疑区域
+
+**1. `parse_sse()` 的状态机逻辑**
+- BOM 剥离、error 检测、JSON 解析、空流检测、tool call 累加
+- 任何一个分支提前 `continue` 或 `break` 都可能丢内容
+
+**2. smol vs tokio 的 Timer 行为**
+- `next_sse_line()` 用 `smol::Timer::after(remaining)` 做超时
+- 每次成功读取后重置 deadline = now + 300s
+- 如果 smol 的 Timer 在低资源环境下行为异常？
+
+**3. 重试层的交互**
+- 空流 → 529 → 重试 → 再次空流 → 无限循环？
+- 用户描述的"一直卡住"完全符合这个模式
+
+**4. 事件通道（flume）的背压**
+- `event_tx.send_async()` 如果接收端处理慢会阻塞
+- UI 线程是否及时消费 ProviderEvent？
+
+---
+
+## 建议下一步排查方向
+
+**优先级从高到低**：
+
+1. **`parse_sse()` 的 early exit 路径** — 加 debug 日志追踪每个 `continue`/`break`
+2. **smol Timer + deadline 逻辑** — 是否是 Timer 导致提前超时
+3. **空流检测 + 重试的死循环** — 是否在反复重试空流
+4. **flume 通道背压** — UI 消费是否及时
+
+---
+
 ## 已提交的改动
+
+### `maki-providers/src/providers/mod.rs`
+
+```rust
+pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
+    isahc::HttpClient::builder()
+        .connect_timeout(timeouts.connect)
+        // NOTE: low_speed_timeout removed — it silently closes connections
+        // when a model takes >30s to produce the first token (e.g. ModelScope
+        // large models during thinking phase).
+        .build()
+        .expect("failed to build HTTP client")
+}
+```
+
+### `maki-providers/src/providers/openai_compat.rs`
+
+修复了 5 个因"空流→529"修复而失效的测试 + 移除重复测试块。
+
+**测试结果**：471 passed, 0 failed
+
+### 提交历史
+
+| 提交 | 描述 |
+|------|------|
+| `0cbe1d97` | fix(providers): remove isahc low_speed_timeout |
+| `8176d520` | docs: add Shangtang fix comparison insights |
+| `9c6fb71b` | docs: ModelScope isahc vs reqwest root cause analysis |
+| `53c24ca8` | test: add ModelScope mock test and update analysis doc |
+| `99dbb9af` | test: add header comparison and buffered read tests |
+| `f7a73ffc` | test: add request diff test (maki vs zerostack) |
+
+---
+
+记录日期：2026-07-24（补充 isahc 编译测试 + 排查方向转变）
