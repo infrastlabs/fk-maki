@@ -356,4 +356,43 @@ pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
 
 ---
 
-记录日期：2026-07-24（补充 Python 测试结果）
+## 补充：isahc 文档关键发现 — BufReader 包裹问题
+
+### isahc 官方文档明确指出
+
+> **"The response body is not a direct stream from the server, but uses its own buffering mechanisms internally for performance. It is therefore undesirable to wrap the body in additional buffering readers."**
+>
+> — isahc docs for `AsyncBody`
+
+### maki 的当前做法（违反建议）
+
+```rust
+// maki-providers/src/providers/openai_compat.rs:176-182
+parse_sse(
+    BufReader::new(response.into_body()),  // ← 违反 isahc 建议！
+    event_tx,
+    self.stream_timeout,
+)
+```
+
+maki 用 `BufReader` 包裹 `isahc::AsyncBody`，而 isahc 明确建议不要这样做。
+
+### 可能的后果
+
+`AsyncBody` 内部已有自己的缓冲机制，额外包裹 `BufReader` 可能导致：
+1. 双重缓冲导致数据读取延迟或阻塞
+2. `poll_read` 行为异常（`AsyncBody` 的唤醒机制与 `BufReader` 不兼容）
+3. 在某些条件下导致读取挂起（看起来像"卡住无响应"）
+
+### Python 验证
+
+Python 测试中直接读取和缓冲读取都能正常工作（Python socket 实现不同），无法复现此问题。**这是 isahc 特有的行为。**
+
+### 进一步修复方向
+
+1. **移除 BufReader**：直接对 `AsyncBody` 使用 `futures_lite::io::lines()`
+2. **迁移到 reqwest**：reqwest 的流式响应没有此限制（与 zerostack 一致）
+
+---
+
+## 已提交的改动
