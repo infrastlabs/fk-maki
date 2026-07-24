@@ -704,7 +704,7 @@ pub async fn parse_sse(
     if content_blocks.is_empty() {
         let reason = stop_reason.map(|s| s.to_string()).unwrap_or_default();
         return Err(AgentError::Api {
-            status: 200,
+            status: 502,
             message: format!("model returned empty stream (stop_reason: {reason})"),
         });
     }
