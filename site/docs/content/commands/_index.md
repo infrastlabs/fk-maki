@@ -33,6 +33,7 @@ Type `/` in the input box to open the command palette.
 | `/packupdate` | Update packages (++lockfile, ! skips review) |
 | `/packdel` | Remove undeclared packages (++all, or a name) |
 | `/memory` | View, edit, and delete memory files |
+| `/monitors` | List running monitors |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
 | `/tasks` | Browse and search tasks |
