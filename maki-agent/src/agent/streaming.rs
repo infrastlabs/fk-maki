@@ -46,6 +46,8 @@ pub(crate) async fn stream_with_retry(
     let messages = maki_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
     let mut retry = RetryState::new();
+    let mut empty_stream_retries: u32 = 0;
+    const MAX_EMPTY_STREAM_RETRIES: u32 = 3;
     loop {
         let (ptx, prx) = flume::unbounded();
         let forwarder = smol::spawn({
@@ -66,6 +68,17 @@ pub(crate) async fn stream_with_retry(
             Ok(r) => return Ok(r),
             Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
             Err(e) if e.is_retryable() => {
+                // Limit retries for empty stream errors (ModelScope returns HTTP 200 + only data: [DONE])
+                let is_empty_stream = matches!(&e, AgentError::Api { status: 502, message } if message.contains("empty stream"));
+                if is_empty_stream {
+                    empty_stream_retries += 1;
+                    if empty_stream_retries >= MAX_EMPTY_STREAM_RETRIES {
+                        return Err(AgentError::Api {
+                            status: 502,
+                            message: format!("ModelScope returned empty stream after {MAX_EMPTY_STREAM_RETRIES} retries (model may be rate-limited or unavailable)"),
+                        });
+                    }
+                }
                 if e.should_rotate_key()
                     && let Ok(true) = provider.rotate_key().await
                 {
