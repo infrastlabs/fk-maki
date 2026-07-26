@@ -438,8 +438,9 @@ enum ThinkingDeltaBlock {
 
 #[derive(Deserialize)]
 struct ChunkChoice {
-    #[serde(alias = "message")]
     delta: Option<ChunkDelta>,
+    #[serde(default)]
+    message: Option<ChunkDelta>,
     finish_reason: Option<String>,
 }
 
@@ -540,7 +541,7 @@ pub async fn parse_sse(
             stop_reason = Some(StopReason::from_openai(&reason));
         }
 
-        let Some(delta) = choice.delta else {
+        let Some(delta) = choice.delta.or(choice.message) else {
             continue;
         };
 

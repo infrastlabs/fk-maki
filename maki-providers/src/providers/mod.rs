@@ -29,8 +29,6 @@ pub(crate) mod synthetic;
 pub(crate) mod tensorx;
 pub(crate) mod zai;
 
-const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
-
 pub(crate) fn user_agent() -> &'static str {
     concat!(
         "maki/v",
@@ -166,7 +164,6 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
 pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
     isahc::HttpClient::builder()
         .connect_timeout(timeouts.connect)
-        .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
         .build()
         .expect("failed to build HTTP client")
 }
