@@ -114,4 +114,63 @@
 
 ---
 
+## 用户输入内容查询
+
+### 用户输入在 session 文件里的格式
+
+`.jsonl` 文件中 `role: "user"` 的 `msg` 记录就是用户输入：
+
+```json
+{"t":"msg","d":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+```
+
+- `t: "msg"` — 消息记录
+- `d.role: "user"` — 用户消息
+- `d.content[0].text` — 用户输入的实际内容
+
+### 获取方法
+
+**命令行 grep：**
+
+```bash
+# 搜索所有 session 中的用户消息
+grep -l '"role":"user"' ~/.local/state/maki/sessions/*.jsonl
+
+# 提取某个 session 的所有用户输入
+grep '"role":"user"' ~/.local/state/maki/sessions/{uuid}.jsonl
+
+# 只提取文本内容
+grep '"role":"user"' ~/.local/state/maki/sessions/*.jsonl | python3 -c "
+import json,sys
+for line in sys.stdin:
+    rec = json.loads(line)
+    for block in rec['d']['content']:
+        if block.get('type') == 'text':
+            print(block['text'])
+"
+```
+
+**Python 解析：**
+
+```python
+import json, glob
+
+for f in glob.glob('~/.local/state/maki/sessions/*.jsonl'):
+    with open(f) as fh:
+        for line in fh:
+            rec = json.loads(line)
+            if rec.get('t') == 'msg' and rec['d']['role'] == 'user':
+                for block in rec['d']['content']:
+                    if block.get('type') == 'text':
+                        print(block['text'])
+```
+
+### 注意
+
+- 用户输入存的是 `content` 数组，通常第一项是 `type: "text"` 的文本
+- 如果用户发了图片，会多一条 `type: "image_url"` 的记录
+- `cwd_latest.json` 索引文件可用来按项目目录定位 session 文件
+
+---
+
 记录日期：2026-07-26
