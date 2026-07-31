@@ -101,6 +101,10 @@ pub struct Cli {
     #[arg(long)]
     pub session_id: Option<String>,
 
+    /// Don't persist the session to disk (--print mode)
+    #[arg(long)]
+    pub no_session: bool,
+
     /// Fork the loaded session under a new ID
     #[arg(long)]
     pub fork_session: bool,

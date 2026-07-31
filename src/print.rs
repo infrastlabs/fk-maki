@@ -146,6 +146,7 @@ pub fn run(
     lua_handle: EventHandle,
     fast: bool,
     workflow: bool,
+    no_session: bool,
 ) -> Result<()> {
     let prompt = match prompt_arg {
         Some(p) => p,
@@ -179,6 +180,7 @@ pub fn run(
         initial_wd: cwd,
         fast,
         workflow,
+        no_session,
     });
 
     let HeadlessHandle {
