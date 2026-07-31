@@ -1,0 +1,11 @@
+[package]
+name = "session-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+maki-storage = { path = "../../maki-storage" }
+maki-providers = { path = "../../maki-providers" }
+serde_json = "1"
+
+[workspace]
