@@ -81,6 +81,7 @@ pub struct HeadlessParams {
     pub initial_wd: PathBuf,
     pub fast: bool,
     pub workflow: bool,
+    pub no_session: bool,
 }
 
 pub struct HeadlessHandle {
@@ -182,6 +183,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let session_ref_clone = session_ref.clone();
     let fast = params.fast;
     let workflow = params.workflow;
+    let no_session = params.no_session;
+    let session_working_dir = working_dir.clone();
     let task = smol::spawn({
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
@@ -204,7 +207,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             let mut agent = Agent::new(
                 AgentParams {
                     provider,
-                    model,
+                    model: model.clone(),
                     config: params.config,
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::new(PermissionManager::new(
@@ -248,6 +251,13 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                 let _ = error_tx.send(AgentEvent::Error {
                     message: e.user_message(),
                 });
+            }
+
+            if !no_session
+                && let Some(mut store) =
+                    SessionStore::open(session_id, &session_working_dir, &model.spec())
+            {
+                store.record_turn(history.as_slice(), model.spec());
             }
 
             if let Some(handle) = mcp_shutdown {

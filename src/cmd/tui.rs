@@ -272,6 +272,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             stack.plugin_host.event_handle(),
             fast,
             stack.config.always_workflow,
+            cli.no_session,
         )
         .context("run print mode")?;
         return Ok(());
