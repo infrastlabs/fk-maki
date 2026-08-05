@@ -499,6 +499,28 @@ struct ToolAccumulator {
     arguments: String,
 }
 
+/// Merge `delta` and `message` fields from the same SSE chunk, preferring
+/// `delta` values but filling in missing fields from `message`. Some proxies
+/// (AxonHub) split `reasoning_content` and `content` across the two fields.
+fn merge_delta(delta: Option<ChunkDelta>, message: Option<ChunkDelta>) -> Option<ChunkDelta> {
+    match (delta, message) {
+        (Some(d), None) | (None, Some(d)) => Some(d),
+        (Some(mut d), Some(m)) => {
+            if d.content.is_none() {
+                d.content = m.content;
+            }
+            if d.reasoning_content.is_none() {
+                d.reasoning_content = m.reasoning_content;
+            }
+            if d.tool_calls.is_none() {
+                d.tool_calls = m.tool_calls;
+            }
+            Some(d)
+        }
+        (None, None) => None,
+    }
+}
+
 pub async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
@@ -565,7 +587,7 @@ pub async fn parse_sse(
             stop_reason = Some(StopReason::from_openai(&reason));
         }
 
-        let Some(delta) = choice.delta.or(choice.message) else {
+        let Some(delta) = merge_delta(choice.delta, choice.message) else {
             continue;
         };
 
