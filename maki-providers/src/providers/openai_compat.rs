@@ -558,6 +558,9 @@ pub async fn parse_sse(
                 if data.contains("tool_call") {
                     debug!(raw_sse = %data, "SSE tool_call chunk");
                 }
+                if data.contains("reasoning") || data.contains("thinking") {
+                    debug!(raw_sse = %data, "SSE thinking chunk");
+                }
                 c
             }
             Err(e) => {
