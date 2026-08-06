@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::model::Model;
@@ -217,12 +217,8 @@ impl Provider for OpenAi {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            if opts.thinking.is_enabled() {
-                body["thinking"] = json!({"type": "enabled"});
-            }
             opts.thinking
                 .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
-            debug!(request_body = %body, "OpenAi stream request body");
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat
