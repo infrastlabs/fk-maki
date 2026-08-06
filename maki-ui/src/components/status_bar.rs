@@ -157,35 +157,32 @@ impl StatusBar {
                     0
                 };
 
-                // Estimate mandatory right-side width (labels, ctx, global)
-                let mut mandatory = 2u16; // spaces between cwd and model
-                if let Some(ref label) = ctx.thinking_label {
-                    mandatory += label.len() as u16 + 3; // " [label]"
-                }
-                if ctx.fast {
-                    mandatory += FAST_LABEL.len() as u16;
-                }
-                if ctx.workflow {
-                    mandatory += WORKFLOW_LABEL.len() as u16;
-                }
-                mandatory += 25; // ctx: "  X/Y (Z%) $C "
-                if ctx.stats.show_global && !ctx.stats.pricing.is_zero() {
-                    mandatory += 10; // " Σ$C "
-                }
-                // Available for cwd_branch + model_id
-                let max_right = area.width.saturating_sub(8).saturating_sub(mandatory);
-                let half = (max_right / 2).max(5);
+                // Truncate cwd_branch and model_id when terminal is narrow.
+                // Estimate ctx+labels width at 35, leave 8 for left side.
+                let max_right = area.width.saturating_sub(43);
+                let half = max_right / 2;
 
-                fn trunc_tail(s: &str, max: u16) -> String {
-                    let w = s.len() as u16;
-                    if w <= max { s.to_string() } else {
-                        let start = s.len() - max as usize;
-                        format!("..{}", &s[start..])
-                    }
-                }
-
-                let cwd = trunc_tail(&self.cwd_branch, half);
-                let model = trunc_tail(ctx.model_id, half);
+                let cwd = if half < 5 {
+                    // Too narrow, just show tail
+                    let s = &self.cwd_branch;
+                    let keep = 5.min(s.len());
+                    s[s.len() - keep..].to_string()
+                } else if (self.cwd_branch.len() as u16) > half {
+                    let keep = (half - 2).max(1) as usize;
+                    format!("..{}", &self.cwd_branch[self.cwd_branch.len() - keep..])
+                } else {
+                    self.cwd_branch.clone()
+                };
+                let model = if half < 5 {
+                    let s = ctx.model_id;
+                    let keep = 5.min(s.len());
+                    s[s.len() - keep..].to_string()
+                } else if (ctx.model_id.len() as u16) > half {
+                    let keep = (half - 2).max(1) as usize;
+                    format!("..{}", &ctx.model_id[ctx.model_id.len() - keep..])
+                } else {
+                    ctx.model_id.to_string()
+                };
 
                 right_spans.push(Span::styled(cwd, theme::current().status_dim));
                 right_spans.push(Span::raw("  "));
