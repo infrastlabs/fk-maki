@@ -157,15 +157,39 @@ impl StatusBar {
                     0
                 };
 
-                right_spans.push(Span::styled(
-                    self.cwd_branch.clone(),
-                    theme::current().status_dim,
-                ));
+                // Estimate mandatory right-side width (labels, ctx, global)
+                let mut mandatory = 2u16; // spaces between cwd and model
+                if let Some(ref label) = ctx.thinking_label {
+                    mandatory += label.len() as u16 + 3; // " [label]"
+                }
+                if ctx.fast {
+                    mandatory += FAST_LABEL.len() as u16;
+                }
+                if ctx.workflow {
+                    mandatory += WORKFLOW_LABEL.len() as u16;
+                }
+                mandatory += 25; // ctx: "  X/Y (Z%) $C "
+                if ctx.stats.show_global && !ctx.stats.pricing.is_zero() {
+                    mandatory += 10; // " Σ$C "
+                }
+                // Available for cwd_branch + model_id
+                let max_right = area.width.saturating_sub(8).saturating_sub(mandatory);
+                let half = (max_right / 2).max(5);
+
+                fn trunc_tail(s: &str, max: u16) -> String {
+                    let w = s.len() as u16;
+                    if w <= max { s.to_string() } else {
+                        let start = s.len() - max as usize;
+                        format!("..{}", &s[start..])
+                    }
+                }
+
+                let cwd = trunc_tail(&self.cwd_branch, half);
+                let model = trunc_tail(ctx.model_id, half);
+
+                right_spans.push(Span::styled(cwd, theme::current().status_dim));
                 right_spans.push(Span::raw("  "));
-                right_spans.push(Span::styled(
-                    ctx.model_id.to_string(),
-                    theme::current().status_dim,
-                ));
+                right_spans.push(Span::styled(model, theme::current().status_dim));
 
                 if let Some(ref label) = ctx.thinking_label {
                     right_spans.push(Span::styled(
@@ -216,9 +240,11 @@ impl StatusBar {
             ));
         }
 
+        let right_width: u16 = right_spans.iter().map(|s| s.width() as u16).sum();
+        let max_right = area.width.saturating_sub(8);
         let [left_area, right_area] = Layout::horizontal([
             Constraint::Min(0),
-            Constraint::Length(right_spans.iter().map(|s| s.width() as u16).sum()),
+            Constraint::Length(right_width.min(max_right)),
         ])
         .areas(area);
 
