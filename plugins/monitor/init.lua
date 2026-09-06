@@ -139,6 +139,7 @@ maki.api.register_tool({
     .. "Use it for a dev server, a test watcher, or a deploy, when you want "
     .. "to know what happened without asking again. Stop it with monitor_stop.",
   schema = SCHEMA,
+  permission = "run",
   -- Starting a job needs the `run` permission, which a bundled plugin
   -- already has. That covers the plugin, not the command: without a scope
   -- here the model could run through this tool anything the bash tool
