@@ -48,3 +48,19 @@ fbd5ea28  feat(monitor)  ← 真实内容（+430 行：插件本体、loader/con
 ## 四、结论
 
 当前 HEAD（e8625909）就是干净目标态：ToolContext 无 mailbox 字段、mailbox 走独立静态通道，均符合预期。无需恢复任何被删字段。
+
+## 五、空壳提交 → 主历史（prs/main）对应项
+
+monitor 相关空壳提交的内容均已在主历史中存在，对应关系如下：
+
+| 空壳提交（feat/ai-0903 上） | 主历史对应提交 | 说明 |
+|---------------------------|--------------|------|
+| 0f71b238 feat(lua): add plugin-owned jobs (07-28) | 91852e22 feat(lua): add plugin-owned jobs (07-28) | 同标题同内容，最直接对应 |
+| 988d3832 feat(providers): observation (07-26) | 并入 00a2959e feat(agent): add a bounded session mailbox (08-01) | main 上 observation 与 mailbox 合并成一个提交实现（MessageKind::Observation 首次出现在 00a2959e 的 types.rs） |
+| 45702d27 feat(agent): shared session mailbox (07-28) | 00a2959e feat(agent): add a bounded session mailbox (08-01) | main 上名为 bounded mailbox（加了容量上限，见 mailbox.rs:217 行），而非分支上的 shared |
+| 90366136 fix(agent): subagent cancel (07-25) | 0f67054c fix(agent): stop a second subagent cancelling the first (07-25) | 同标题同内容，同一天 |
+
+关键发现：
+1. 三个空壳提交都有主历史来源：0f71b238→91852e22、90366136→0f67054c 是逐字对应的；988d3832+45702d27 在 main 上被合并压缩成 00a2959e（所以分支上拆成两个 pick，main 里是一个 bounded mailbox 提交）
+2. main 版本更先进：00a2959e 是 bounded mailbox（带容量/压缩处理，compaction.rs +32 行），比分支上的 shared mailbox 版本完整——分支上的空壳只是历史快照，真实代码以 main 为准
+3. 这也再次印证：9bd78ee0 revert 掉的字段在 main 上本来就不存在该形态——main 的 00a2959e 才是 mailbox 的权威实现
