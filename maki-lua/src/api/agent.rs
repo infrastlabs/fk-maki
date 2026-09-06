@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
-use maki_agent::agent::tool_dispatch::{self, Emit};
+use maki_agent::agent::tool_dispatch;
 use maki_agent::cancel::{CancelMap, CancelSlot};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
